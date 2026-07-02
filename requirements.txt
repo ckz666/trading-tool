@@ -1,0 +1,9 @@
+ccxt>=4.5
+fastapi>=0.138
+uvicorn[standard]>=0.49
+rich>=15.0
+pandas>=2.0
+numpy>=2.0
+websockets>=16.0
+python-dotenv>=1.0
+aiohttp>=3.14
