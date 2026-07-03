@@ -16,6 +16,7 @@ from trading.futures_paper import FuturesPaperEngine
 from trading.backtest import run_backtest
 from ai.backtest import run_backtest as run_mtf_backtest
 from trading.autotrader import AutoTrader
+from trading.funding_harvest import FundingHarvestEngine, FundingHarvester
 from trading.risk import RiskConfig
 from strategies.base import STRATEGIES
 from monitoring.alerts import AlertManager
@@ -29,6 +30,9 @@ futures_paper = FuturesPaperEngine()
 alert_mgr = AlertManager()
 autotrader: AutoTrader = None
 _autotrader_starting = False
+funding_harvest_engine = FundingHarvestEngine()
+funding_harvester: FundingHarvester = None
+_funding_harvester_starting = False
 _price_cache: dict[str, dict] = {}
 _ws_clients: list[WebSocket] = []
 
@@ -469,6 +473,76 @@ def get_autotrader_log(limit: int = 50, symbol: str = None):
     if not autotrader:
         return []
     return autotrader.get_log(limit, symbol)
+
+
+# ── Funding-Rate Harvest (delta-neutral spot+perp, separate from the trend/scalp AutoTrader) ──
+class FundingHarvestStartRequest(BaseModel):
+    symbols: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
+    interval_seconds: int = 900
+    entry_rate_threshold: float = 0.00008
+    exit_rate_threshold: float = 0.00002
+    max_basis_pct: float = 0.5
+    max_position_pct: float = 0.25
+    leverage: int = 2
+
+
+@app.post("/api/funding-harvest/start")
+async def start_funding_harvest(req: FundingHarvestStartRequest):
+    global funding_harvester, _funding_harvester_starting
+    if _funding_harvester_starting or (funding_harvester and funding_harvester.running):
+        raise HTTPException(400, "FundingHarvester already running")
+    _funding_harvester_starting = True
+    try:
+        funding_harvester = FundingHarvester(
+            symbols=req.symbols,
+            engine=funding_harvest_engine,
+            interval_seconds=req.interval_seconds,
+            entry_rate_threshold=req.entry_rate_threshold,
+            exit_rate_threshold=req.exit_rate_threshold,
+            max_basis_pct=req.max_basis_pct,
+            max_position_pct=req.max_position_pct,
+            leverage=req.leverage,
+        )
+        funding_harvester.start()
+        return {"status": "started"}
+    finally:
+        _funding_harvester_starting = False
+
+
+@app.post("/api/funding-harvest/stop")
+async def stop_funding_harvest():
+    if not funding_harvester or not funding_harvester.running:
+        raise HTTPException(400, "FundingHarvester not running")
+    await funding_harvester.stop()
+    return {"status": "stopped"}
+
+
+@app.get("/api/funding-harvest/status")
+async def funding_harvest_status():
+    prices = {}
+    if funding_harvest_engine.positions:
+        async with BitgetClient() as spot, FuturesClient() as perp:
+            for sym in funding_harvest_engine.positions:
+                try:
+                    s, p = await asyncio.gather(spot.fetch_ticker(sym), perp.fetch_ticker(sym))
+                    prices[sym] = {"spot": s["last"], "perp": p["last"]}
+                except Exception:
+                    continue
+    base = funding_harvester.status() if funding_harvester else {"running": False}
+    base["engine"] = funding_harvest_engine.status(prices)
+    return base
+
+
+@app.get("/api/funding-harvest/history")
+def funding_harvest_history(limit: int = 50):
+    return list(reversed(funding_harvest_engine.trade_history[-limit:]))
+
+
+@app.get("/api/funding-harvest/log")
+def funding_harvest_log(limit: int = 50):
+    if not funding_harvester:
+        return []
+    return funding_harvester.log[-limit:]
 
 
 @app.get("/api/market/trending")

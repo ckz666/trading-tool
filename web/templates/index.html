@@ -300,6 +300,9 @@ button:disabled { opacity: 0.4; cursor: default; }
   <button class="nav-tab" onclick="showTab('tools', this)">
     <span class="tab-icon">⚙</span>Tools
   </button>
+  <button class="nav-tab" onclick="showTab('funding', this)">
+    <span class="tab-icon">%</span>Funding
+  </button>
 </nav>
 
 <!-- ══════════════════════ DASHBOARD ══════════════════════ -->
@@ -589,6 +592,89 @@ button:disabled { opacity: 0.4; cursor: default; }
   </div>
 </div>
 
+<!-- ══════════════════════ FUNDING HARVEST ══════════════════════ -->
+<div id="tab-funding" class="page">
+  <div class="grid2" style="margin-bottom:12px;">
+
+    <!-- Config -->
+    <div class="card">
+      <div class="card-title">Delta-Neutral Funding Harvest</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.5;">
+        Spot Long + Perp Short auf dasselbe Symbol, gleiches Notional. Preisrisiko neutralisiert sich weitgehend —
+        Ertrag kommt aus der Funding-Zahlung bei positiver Rate, nicht aus einer Richtungswette.
+      </div>
+      <div class="cfg-grid">
+        <div class="fg"><label>Scan-Intervall (Sek.)</label>
+          <input id="fh-interval" type="number" value="900" min="60"></div>
+        <div class="fg"><label>Leverage (Perp-Bein)</label>
+          <input id="fh-leverage" type="number" value="2" min="1" max="5"></div>
+        <div class="fg"><label>Entry-Rate (%/8h)</label>
+          <input id="fh-entry" type="number" value="0.008" min="0" step="0.001"></div>
+        <div class="fg"><label>Exit-Rate (%/8h)</label>
+          <input id="fh-exit" type="number" value="0.002" min="0" step="0.001"></div>
+        <div class="fg"><label>Max Basis (%)</label>
+          <input id="fh-basis" type="number" value="0.5" min="0.1" step="0.1"></div>
+        <div class="fg"><label>Max % Kapital/Symbol</label>
+          <input id="fh-maxpos" type="number" value="25" min="5" max="100"></div>
+      </div>
+      <div class="fg" style="margin-bottom:12px;">
+        <label>Symbole (kommagetrennt)</label>
+        <input id="fh-symbols" type="text" value="BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT" style="width:100%">
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="primary" id="fh-start-btn" onclick="startFundingHarvest()" style="flex:1">▶ Start</button>
+        <button class="danger"  id="fh-stop-btn"  onclick="stopFundingHarvest()" style="flex:1" disabled>■ Stop</button>
+      </div>
+    </div>
+
+    <!-- Status -->
+    <div class="card">
+      <div class="card-title">Status</div>
+      <div class="stats" style="margin-bottom:12px;">
+        <div class="stat"><div class="lbl">Balance</div><div class="val" id="fh-balance">—</div></div>
+        <div class="stat"><div class="lbl">Portfolio</div><div class="val" id="fh-portfolio">—</div></div>
+        <div class="stat"><div class="lbl">Funding verdient</div><div class="val" id="fh-funding">—</div></div>
+        <div class="stat"><div class="lbl">Gebühren</div><div class="val" id="fh-fees">—</div></div>
+      </div>
+      <div style="font-size:10px;color:var(--muted);font-weight:600;letter-spacing:0.5px;margin-bottom:6px;">AKTUELLE RATEN</div>
+      <div id="fh-rates" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+    </div>
+  </div>
+
+  <!-- Positions -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">Offene Positionen (<span id="fh-pos-count">0</span>)</div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Notional</th><th>Hebel</th><th>Basis</th>
+          <th>Funding verdient</th><th>Preis-P&L</th><th>Netto P&L</th><th>Eröffnet</th>
+        </tr></thead>
+        <tbody id="fh-positions-body"><tr class="empty-row"><td colspan="8">Keine offenen Positionen</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- History -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">Historie (<span id="fh-history-count">0</span>)</div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead><tr>
+          <th>Zeit</th><th>Symbol</th><th>Aktion</th><th>Funding</th><th>Spot-P&L</th><th>Perp-P&L</th><th>Netto</th><th>Grund</th>
+        </tr></thead>
+        <tbody id="fh-history-body"><tr class="empty-row"><td colspan="8">Keine Trades</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="card">
+    <div class="card-title">Log</div>
+    <div id="fh-log" class="log" style="max-height:260px;"></div>
+  </div>
+</div>
+
 <script>
 // ── WebSocket ──────────────────────────────────────────────────────────────
 const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -612,6 +698,9 @@ function showTab(name, btn) {
   if (btn) btn.classList.add('active');
   if (name === 'autotrader' && !document.getElementById('trending-grid').querySelector('.trend-card')) {
     refreshTrending();
+  }
+  if (name === 'funding') {
+    refreshFundingHarvest();
   }
 }
 
@@ -1395,6 +1484,134 @@ refreshBalance();
 setInterval(refreshBalance, 30000);
 setInterval(refreshWhales, 60000);
 
+// ── Funding Harvest ────────────────────────────────────────────────────────
+async function startFundingHarvest() {
+  const symbols = document.getElementById('fh-symbols').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  const body = {
+    symbols,
+    interval_seconds: Number(document.getElementById('fh-interval').value),
+    leverage: Number(document.getElementById('fh-leverage').value),
+    entry_rate_threshold: Number(document.getElementById('fh-entry').value) / 100,
+    exit_rate_threshold: Number(document.getElementById('fh-exit').value) / 100,
+    max_basis_pct: Number(document.getElementById('fh-basis').value),
+    max_position_pct: Number(document.getElementById('fh-maxpos').value) / 100,
+  };
+  try {
+    const r = await fetch('/api/funding-harvest/start', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    if (!r.ok) { const e = await r.json(); alert('Start fehlgeschlagen: ' + (e.detail || r.status)); return; }
+    document.getElementById('fh-start-btn').disabled = true;
+    document.getElementById('fh-start-btn').textContent = 'Läuft...';
+    document.getElementById('fh-stop-btn').disabled = false;
+    refreshFundingHarvest();
+  } catch(e) { alert('Start fehlgeschlagen: ' + e); }
+}
+
+async function stopFundingHarvest() {
+  try {
+    await fetch('/api/funding-harvest/stop', { method: 'POST' });
+    document.getElementById('fh-start-btn').disabled = false;
+    document.getElementById('fh-start-btn').textContent = '▶ Start';
+    document.getElementById('fh-stop-btn').disabled = true;
+  } catch(e) { alert('Stop fehlgeschlagen: ' + e); }
+}
+
+function renderFundingPositions(positions) {
+  const tbody = document.getElementById('fh-positions-body');
+  const entries = Object.entries(positions || {});
+  document.getElementById('fh-pos-count').textContent = entries.length;
+  if (!entries.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Keine offenen Positionen</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  entries.forEach(([sym, p]) => {
+    const notional = (p.spot_qty || 0) * (p.entry_spot_price || 0);
+    const pc = pnlColor(p.net_pnl || 0);
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td style="font-weight:700">${sym.replace('/USDT','')}</td>
+      <td>$${fmt(notional)}</td>
+      <td style="color:var(--blue)">${p.leverage}x</td>
+      <td>${(p.basis_pct||0).toFixed(3)}%</td>
+      <td style="color:var(--green)">+${fmt(p.funding_accrued||0)}</td>
+      <td style="color:${pnlColor(p.unrealized_price_pnl||0)}">${pnlStr(p.unrealized_price_pnl||0)}</td>
+      <td style="color:${pc};font-weight:700">${pnlStr(p.net_pnl||0)}</td>
+      <td class="muted">${fmtTime(p.opened_at)}</td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+function renderFundingHistory(trades) {
+  const tbody = document.getElementById('fh-history-body');
+  document.getElementById('fh-history-count').textContent = trades.length;
+  if (!trades.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Keine Trades</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  trades.forEach(t => {
+    const pc = t.net_pnl != null ? pnlColor(t.net_pnl) : 'var(--muted)';
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td class="muted">${fmtTime(t.ts)}</td>
+      <td style="font-weight:700">${(t.symbol||'—').replace('/USDT','')}</td>
+      <td>${t.action === 'open' ? 'Open' : 'Close'}</td>
+      <td style="color:var(--green)">${t.funding_earned!=null ? '+'+fmt(t.funding_earned) : '—'}</td>
+      <td>${t.spot_pnl!=null ? pnlStr(t.spot_pnl) : '—'}</td>
+      <td>${t.perp_pnl!=null ? pnlStr(t.perp_pnl) : '—'}</td>
+      <td style="color:${pc};font-weight:700">${t.net_pnl!=null ? pnlStr(t.net_pnl) : '—'}</td>
+      <td class="muted">${t.reason || '—'}</td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+async function refreshFundingHarvest() {
+  try {
+    const s = await (await fetch('/api/funding-harvest/status')).json();
+    document.getElementById('fh-start-btn').disabled = !!s.running;
+    document.getElementById('fh-start-btn').textContent = s.running ? 'Läuft...' : '▶ Start';
+    document.getElementById('fh-stop-btn').disabled = !s.running;
+
+    const eng = s.engine || {};
+    document.getElementById('fh-balance').textContent = eng.balance != null ? '$' + fmt(eng.balance) : '—';
+    document.getElementById('fh-portfolio').textContent = eng.portfolio_value != null ? '$' + fmt(eng.portfolio_value) : '—';
+    document.getElementById('fh-funding').textContent = eng.total_funding_earned != null ? '+$' + fmt(eng.total_funding_earned) : '—';
+    document.getElementById('fh-fees').textContent = eng.total_fees_paid != null ? '$' + fmt(eng.total_fees_paid) : '—';
+
+    const ratesEl = document.getElementById('fh-rates');
+    ratesEl.innerHTML = '';
+    Object.entries(s.last_rates || {}).forEach(([sym, rate]) => {
+      const apr = rate * 3 * 365 * 100;
+      const span = document.createElement('span');
+      span.className = 'pill ' + (rate >= (s.entry_rate_threshold||0) ? 'pill-green' : 'pill-gray');
+      span.textContent = `${sym.replace('/USDT','')}: ${(rate*100).toFixed(4)}% (~${apr.toFixed(0)}% APR)`;
+      ratesEl.appendChild(span);
+    });
+
+    renderFundingPositions(eng.positions);
+
+    const history = await (await fetch('/api/funding-harvest/history?limit=50')).json();
+    renderFundingHistory(history);
+
+    const log = await (await fetch('/api/funding-harvest/log?limit=50')).json();
+    const logEl = document.getElementById('fh-log');
+    logEl.innerHTML = '';
+    log.slice().reverse().forEach(entry => {
+      const line = document.createElement('div');
+      line.className = 'log-line ' + (entry.level || '');
+      const sym = entry.symbol && entry.symbol !== 'ALL' ? `[${entry.symbol.replace('/USDT','')}] ` : '';
+      line.textContent = `[${fmtTime(entry.ts)}] ${sym}${entry.msg}`;
+      logEl.appendChild(line);
+    });
+
+    if (s.running) setTimeout(refreshFundingHarvest, 8000);
+  } catch(e) { console.error('refreshFundingHarvest:', e); }
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────
 (async () => {
   try {
@@ -1406,6 +1623,15 @@ setInterval(refreshWhales, 60000);
       safePollAutotraderStatus();
     }
   } catch(e) { console.warn('Init check failed:', e); }
+  try {
+    const fs = await (await fetch('/api/funding-harvest/status')).json();
+    if (fs.running) {
+      document.getElementById('fh-start-btn').textContent = 'Läuft...';
+      document.getElementById('fh-start-btn').disabled = true;
+      document.getElementById('fh-stop-btn').disabled = false;
+      refreshFundingHarvest();
+    }
+  } catch(e) { console.warn('Funding harvest init check failed:', e); }
 })();
 </script>
 </body>
