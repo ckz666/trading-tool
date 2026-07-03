@@ -99,6 +99,16 @@ def _resample_htf_indicators(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     c = df["close"].resample(rule).last()
     htf = pd.DataFrame({"open": o, "high": h, "low": l, "close": c}).dropna()
 
+    # ADX needs >= 2x its window (28 for window=14) or the ta library indexes
+    # past the end of the series instead of returning NaN — verified empirically,
+    # not documented. Callers with a small df (e.g. Grid's fetch) would otherwise crash here.
+    if len(htf) < 30:
+        empty_idx = pd.DatetimeIndex([], name=df.index.name)
+        return pd.DataFrame({"rsi": pd.Series(dtype=float, index=empty_idx),
+                              "adx": pd.Series(dtype=float, index=empty_idx),
+                              "ema_cross_norm": pd.Series(dtype=float, index=empty_idx),
+                              "macd_diff": pd.Series(dtype=float, index=empty_idx)})
+
     rsi  = ta.momentum.RSIIndicator(htf["close"]).rsi()
     adx  = ta.trend.ADXIndicator(htf["high"], htf["low"], htf["close"], 14).adx()
     ema9, ema21 = ta.trend.ema_indicator(htf["close"], 9), ta.trend.ema_indicator(htf["close"], 21)

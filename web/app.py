@@ -17,6 +17,7 @@ from trading.backtest import run_backtest
 from ai.backtest import run_backtest as run_mtf_backtest
 from trading.autotrader import AutoTrader
 from trading.funding_harvest import FundingHarvestEngine, FundingHarvester
+from trading.grid import GridEngine, GridTrader
 from trading.risk import RiskConfig
 from strategies.base import STRATEGIES
 from monitoring.alerts import AlertManager
@@ -33,6 +34,9 @@ _autotrader_starting = False
 funding_harvest_engine = FundingHarvestEngine()
 funding_harvester: FundingHarvester = None
 _funding_harvester_starting = False
+grid_engine = GridEngine()
+grid_trader: GridTrader = None
+_grid_trader_starting = False
 _price_cache: dict[str, dict] = {}
 _ws_clients: list[WebSocket] = []
 
@@ -543,6 +547,78 @@ def funding_harvest_log(limit: int = 50):
     if not funding_harvester:
         return []
     return funding_harvester.log[-limit:]
+
+
+# ── Grid Trading (structural range-oscillation edge, separate from everything else) ──
+class GridStartRequest(BaseModel):
+    symbols: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
+    interval_seconds: int = 300
+    timeframe: str = "1h"
+    n_levels: int = 10
+    atr_range_mult: float = 2.0
+    capital_per_grid_pct: float = 0.20
+    stop_loss_pct: float = 0.03
+    adx_ranging_max: float = 20.0
+
+
+@app.post("/api/grid/start")
+async def start_grid(req: GridStartRequest):
+    global grid_trader, _grid_trader_starting
+    if _grid_trader_starting or (grid_trader and grid_trader.running):
+        raise HTTPException(400, "GridTrader already running")
+    _grid_trader_starting = True
+    try:
+        grid_trader = GridTrader(
+            symbols=req.symbols,
+            engine=grid_engine,
+            interval_seconds=req.interval_seconds,
+            timeframe=req.timeframe,
+            n_levels=req.n_levels,
+            atr_range_mult=req.atr_range_mult,
+            capital_per_grid_pct=req.capital_per_grid_pct,
+            stop_loss_pct=req.stop_loss_pct,
+            adx_ranging_max=req.adx_ranging_max,
+        )
+        grid_trader.start()
+        return {"status": "started"}
+    finally:
+        _grid_trader_starting = False
+
+
+@app.post("/api/grid/stop")
+async def stop_grid():
+    if not grid_trader or not grid_trader.running:
+        raise HTTPException(400, "GridTrader not running")
+    await grid_trader.stop()
+    return {"status": "stopped"}
+
+
+@app.get("/api/grid/status")
+async def grid_status():
+    prices = {}
+    if grid_engine.grids:
+        async with FuturesClient() as client:
+            for sym in grid_engine.grids:
+                try:
+                    t = await client.fetch_ticker(sym)
+                    prices[sym] = t["last"]
+                except Exception:
+                    continue
+    base = grid_trader.status() if grid_trader else {"running": False}
+    base["engine"] = grid_engine.status(prices)
+    return base
+
+
+@app.get("/api/grid/history")
+def grid_history(limit: int = 50):
+    return list(reversed(grid_engine.trade_history[-limit:]))
+
+
+@app.get("/api/grid/log")
+def grid_log(limit: int = 50):
+    if not grid_trader:
+        return []
+    return grid_trader.log[-limit:]
 
 
 @app.get("/api/market/trending")

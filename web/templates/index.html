@@ -673,6 +673,73 @@ button:disabled { opacity: 0.4; cursor: default; }
     <div class="card-title">Log</div>
     <div id="fh-log" class="log" style="max-height:260px;"></div>
   </div>
+
+  <hr style="border:none;border-top:1px solid var(--border);margin:20px 0;">
+
+  <!-- ── Grid Trading ─────────────────────────────────────────────────────── -->
+  <div class="grid2" style="margin-bottom:12px;">
+
+    <div class="card">
+      <div class="card-title">Grid Trading</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.5;">
+        Kauf-/Verkaufsleiter um den aktuellen Preis, nur in erkannten Range-Regimen (ADX &lt; 20).
+        Verdient an der Oszillation selbst, keine Richtungsvorhersage. Stop-Loss schließt das
+        gesamte Grid, falls der Preis nach unten aus der Range ausbricht.
+      </div>
+      <div class="cfg-grid">
+        <div class="fg"><label>Scan-Intervall (Sek.)</label>
+          <input id="gr-interval" type="number" value="300" min="60"></div>
+        <div class="fg"><label>Timeframe</label>
+          <select id="gr-tf"><option value="15m">15m</option><option value="1h" selected>1h</option><option value="4h">4h</option></select></div>
+        <div class="fg"><label>Grid-Level</label>
+          <input id="gr-levels" type="number" value="10" min="3" max="30"></div>
+        <div class="fg"><label>Range (x ATR)</label>
+          <input id="gr-atr-mult" type="number" value="2.0" min="0.5" step="0.5"></div>
+        <div class="fg"><label>Kapital/Grid (%)</label>
+          <input id="gr-capital" type="number" value="20" min="5" max="100"></div>
+        <div class="fg"><label>Stop-Loss (%)</label>
+          <input id="gr-stoploss" type="number" value="3" min="1" max="20"></div>
+      </div>
+      <div class="fg" style="margin-bottom:12px;">
+        <label>Symbole (kommagetrennt)</label>
+        <input id="gr-symbols" type="text" value="BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT" style="width:100%">
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="primary" id="gr-start-btn" onclick="startGrid()" style="flex:1">▶ Start</button>
+        <button class="danger"  id="gr-stop-btn"  onclick="stopGrid()" style="flex:1" disabled>■ Stop</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Status</div>
+      <div class="stats" style="margin-bottom:12px;">
+        <div class="stat"><div class="lbl">Balance</div><div class="val" id="gr-balance">—</div></div>
+        <div class="stat"><div class="lbl">Portfolio</div><div class="val" id="gr-portfolio">—</div></div>
+        <div class="stat"><div class="lbl">Realisiert</div><div class="val" id="gr-pnl">—</div></div>
+        <div class="stat"><div class="lbl">Gebühren</div><div class="val" id="gr-fees">—</div></div>
+      </div>
+      <div style="font-size:10px;color:var(--muted);font-weight:600;letter-spacing:0.5px;margin-bottom:6px;">REGIME JE SYMBOL</div>
+      <div id="gr-regimes" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">Aktive Grids (<span id="gr-count">0</span>)</div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Range</th><th>Level (gehalten)</th><th>Trades</th>
+          <th>Realisiert</th><th>Wert</th><th>In Range</th><th>Eröffnet</th>
+        </tr></thead>
+        <tbody id="gr-grids-body"><tr class="empty-row"><td colspan="8">Keine aktiven Grids</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Log</div>
+    <div id="gr-log" class="log" style="max-height:260px;"></div>
+  </div>
 </div>
 
 <script>
@@ -701,6 +768,7 @@ function showTab(name, btn) {
   }
   if (name === 'funding') {
     refreshFundingHarvest();
+    refreshGrid();
   }
 }
 
@@ -1612,6 +1680,107 @@ async function refreshFundingHarvest() {
   } catch(e) { console.error('refreshFundingHarvest:', e); }
 }
 
+// ── Grid Trading ───────────────────────────────────────────────────────────
+async function startGrid() {
+  const symbols = document.getElementById('gr-symbols').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  const body = {
+    symbols,
+    interval_seconds: Number(document.getElementById('gr-interval').value),
+    timeframe: document.getElementById('gr-tf').value,
+    n_levels: Number(document.getElementById('gr-levels').value),
+    atr_range_mult: Number(document.getElementById('gr-atr-mult').value),
+    capital_per_grid_pct: Number(document.getElementById('gr-capital').value) / 100,
+    stop_loss_pct: Number(document.getElementById('gr-stoploss').value) / 100,
+  };
+  try {
+    const r = await fetch('/api/grid/start', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    if (!r.ok) { const e = await r.json(); alert('Start fehlgeschlagen: ' + (e.detail || r.status)); return; }
+    document.getElementById('gr-start-btn').disabled = true;
+    document.getElementById('gr-start-btn').textContent = 'Läuft...';
+    document.getElementById('gr-stop-btn').disabled = false;
+    refreshGrid();
+  } catch(e) { alert('Start fehlgeschlagen: ' + e); }
+}
+
+async function stopGrid() {
+  try {
+    await fetch('/api/grid/stop', { method: 'POST' });
+    document.getElementById('gr-start-btn').disabled = false;
+    document.getElementById('gr-start-btn').textContent = '▶ Start';
+    document.getElementById('gr-stop-btn').disabled = true;
+  } catch(e) { alert('Stop fehlgeschlagen: ' + e); }
+}
+
+function renderGrids(grids) {
+  const tbody = document.getElementById('gr-grids-body');
+  const entries = Object.entries(grids || {});
+  document.getElementById('gr-count').textContent = entries.length;
+  if (!entries.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Keine aktiven Grids</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  entries.forEach(([sym, g]) => {
+    const pc = pnlColor(g.realized_pnl || 0);
+    const inRange = g.in_range === true ? '<span class="pill pill-green">in Range</span>'
+                   : g.in_range === false ? '<span class="pill pill-red">außerhalb</span>' : '—';
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td style="font-weight:700">${sym.replace('/USDT','')}</td>
+      <td>$${fmt(g.lower,0)} – $${fmt(g.upper,0)}</td>
+      <td>${g.levels_holding}/${g.n_levels}</td>
+      <td>${g.trades}</td>
+      <td style="color:${pc};font-weight:700">${pnlStr(g.realized_pnl||0)}</td>
+      <td>${g.value!=null ? '$'+fmt(g.value) : '—'}</td>
+      <td>${inRange}</td>
+      <td class="muted">${fmtTime(g.opened_at)}</td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+async function refreshGrid() {
+  try {
+    const s = await (await fetch('/api/grid/status')).json();
+    document.getElementById('gr-start-btn').disabled = !!s.running;
+    document.getElementById('gr-start-btn').textContent = s.running ? 'Läuft...' : '▶ Start';
+    document.getElementById('gr-stop-btn').disabled = !s.running;
+
+    const eng = s.engine || {};
+    document.getElementById('gr-balance').textContent = eng.balance != null ? '$' + fmt(eng.balance) : '—';
+    document.getElementById('gr-portfolio').textContent = eng.portfolio_value != null ? '$' + fmt(eng.portfolio_value) : '—';
+    document.getElementById('gr-pnl').textContent = eng.total_realized_pnl != null ? pnlStr(eng.total_realized_pnl) : '—';
+    document.getElementById('gr-fees').textContent = eng.total_fees_paid != null ? '$' + fmt(eng.total_fees_paid) : '—';
+
+    const regEl = document.getElementById('gr-regimes');
+    regEl.innerHTML = '';
+    const regimeColor = {ranging:'pill-green', trending:'pill-blue', strong_trend:'pill-blue', transitioning:'pill-gray'};
+    Object.entries(s.last_regime || {}).forEach(([sym, regime]) => {
+      const span = document.createElement('span');
+      span.className = 'pill ' + (regimeColor[regime] || 'pill-gray');
+      span.textContent = `${sym.replace('/USDT','')}: ${regime}`;
+      regEl.appendChild(span);
+    });
+
+    renderGrids(eng.grids);
+
+    const log = await (await fetch('/api/grid/log?limit=50')).json();
+    const logEl = document.getElementById('gr-log');
+    logEl.innerHTML = '';
+    log.slice().reverse().forEach(entry => {
+      const line = document.createElement('div');
+      line.className = 'log-line ' + (entry.level || '');
+      const sym = entry.symbol && entry.symbol !== 'ALL' ? `[${entry.symbol.replace('/USDT','')}] ` : '';
+      line.textContent = `[${fmtTime(entry.ts)}] ${sym}${entry.msg}`;
+      logEl.appendChild(line);
+    });
+
+    if (s.running) setTimeout(refreshGrid, 8000);
+  } catch(e) { console.error('refreshGrid:', e); }
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────
 (async () => {
   try {
@@ -1632,6 +1801,15 @@ async function refreshFundingHarvest() {
       refreshFundingHarvest();
     }
   } catch(e) { console.warn('Funding harvest init check failed:', e); }
+  try {
+    const gs = await (await fetch('/api/grid/status')).json();
+    if (gs.running) {
+      document.getElementById('gr-start-btn').textContent = 'Läuft...';
+      document.getElementById('gr-start-btn').disabled = true;
+      document.getElementById('gr-stop-btn').disabled = false;
+      refreshGrid();
+    }
+  } catch(e) { console.warn('Grid init check failed:', e); }
 })();
 </script>
 </body>
