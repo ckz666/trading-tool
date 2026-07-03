@@ -9,6 +9,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 import ta
 
+from ai.patterns import detect_patterns
+
 
 MODEL_KEYS = ["gbm", "rf", "et"]
 
@@ -84,6 +86,48 @@ def _squeeze_indicators(df: pd.DataFrame, period: int = 20,
     }, index=df.index)
 
 
+def _resample_htf_indicators(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample 1h OHLC to a higher timeframe (derived from the same data, no
+    extra fetch) and compute a few indicators on it. Shifted by one period
+    before the caller reindexes it back onto the 1h index, so each 1h bar only
+    ever sees the last fully-closed higher-timeframe bar — never the one it's
+    currently inside of (that would leak the future into the training label).
+    """
+    o = df["open"].resample(rule).first()
+    h = df["high"].resample(rule).max()
+    l = df["low"].resample(rule).min()
+    c = df["close"].resample(rule).last()
+    htf = pd.DataFrame({"open": o, "high": h, "low": l, "close": c}).dropna()
+
+    rsi  = ta.momentum.RSIIndicator(htf["close"]).rsi()
+    adx  = ta.trend.ADXIndicator(htf["high"], htf["low"], htf["close"], 14).adx()
+    ema9, ema21 = ta.trend.ema_indicator(htf["close"], 9), ta.trend.ema_indicator(htf["close"], 21)
+    macd_diff = ta.trend.MACD(htf["close"]).macd_diff()
+
+    out = pd.DataFrame({
+        "rsi":            rsi,
+        "adx":            adx,
+        "ema_cross_norm": (ema9 - ema21) / htf["close"],
+        "macd_diff":      macd_diff,
+    })
+    return out.shift(1)
+
+
+def _pattern_signal(df: pd.DataFrame) -> pd.Series:
+    """Rolling candlestick-pattern signal: bullish minus bearish pattern count
+    over the trailing 5-candle window ending at each bar. Reuses the same
+    pattern detector the live confluence scorer uses, so the ML model can
+    learn nonlinear combinations of the same signal instead of only getting
+    it as fixed confluence points."""
+    signal = pd.Series(0.0, index=df.index)
+    for i in range(4, len(df)):
+        pats = detect_patterns(df.iloc[i - 4: i + 1])
+        bulls = sum(1 for v in pats.values() if v == "bullish")
+        bears = sum(1 for v in pats.values() if v == "bearish")
+        signal.iloc[i] = bulls - bears
+    return signal
+
+
 def build_features(df: pd.DataFrame, funding_series: pd.Series = None) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
 
@@ -128,6 +172,21 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None) -> pd.Dat
         f["funding_norm"] = (aligned / 0.0001).clip(-5, 5)
         # Trend: 3-period change (are longs paying more or less?)
         f["funding_trend"] = aligned.diff(3) / 0.0001
+
+    # 4H context (4 features: resampled from this same 1h data, no extra fetch —
+    # lets the model see whether the bigger-picture trend agrees with the 1h read).
+    # Neutral-filled rather than left NaN during the 4H-indicator warmup window,
+    # so early rows aren't dropped wholesale from an already-small dataset.
+    htf_4h = _resample_htf_indicators(df, "4h")
+    aligned_4h = htf_4h.reindex(df.index, method="ffill")
+    f["rsi_4h"]            = aligned_4h["rsi"].fillna(50.0)
+    f["adx_4h"]            = aligned_4h["adx"].fillna(0.0)
+    f["ema_cross_norm_4h"] = aligned_4h["ema_cross_norm"].fillna(0.0)
+    f["macd_diff_4h"]      = aligned_4h["macd_diff"].fillna(0.0)
+
+    # Candlestick pattern signal (1 feature): lets the ensemble learn nonlinear
+    # combinations of the same patterns the confluence scorer already checks
+    f["pattern_signal"] = _pattern_signal(df)
 
     return f
 

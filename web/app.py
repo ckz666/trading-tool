@@ -335,6 +335,7 @@ class AutotraderStartRequest(BaseModel):
     min_claude_confidence: float = 0.65
     min_ml_conf: float = 0.35
     min_confluence: int = 8
+    min_dir_precision: float = 0.30
 
 
 @app.post("/api/autotrader/start")
@@ -365,6 +366,7 @@ async def start_autotrader(req: AutotraderStartRequest):
             min_claude_confidence=req.min_claude_confidence,
             min_ml_conf=req.min_ml_conf,
             min_confluence=req.min_confluence,
+            min_dir_precision=req.min_dir_precision,
         )
         _add_watch_symbols(req.symbols)
         train_results = await autotrader.startup()
@@ -388,6 +390,7 @@ class AutotraderConfigPatch(BaseModel):
     max_leverage: int = None
     max_open_positions: int = None
     max_same_direction: int = None
+    min_dir_precision: float = None
 
 @app.patch("/api/autotrader/config")
 def patch_autotrader_config(patch: AutotraderConfigPatch):
@@ -409,6 +412,9 @@ def patch_autotrader_config(patch: AutotraderConfigPatch):
     if patch.max_same_direction is not None:
         autotrader.max_same_direction = patch.max_same_direction
         changed["max_same_direction"] = patch.max_same_direction
+    if patch.min_dir_precision is not None:
+        autotrader.min_dir_precision = patch.min_dir_precision
+        changed["min_dir_precision"] = patch.min_dir_precision
     return {"status": "updated", "changed": changed}
 
 

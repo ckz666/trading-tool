@@ -29,6 +29,7 @@ class AutoTrader:
         min_claude_confidence: float = 0.65,
         min_ml_conf: float = 0.35,
         min_confluence: int = 8,
+        min_dir_precision: float = 0.30,
     ):
         self.symbols = list(symbols or DEFAULT_SYMBOLS)
         self.timeframe = timeframe
@@ -46,6 +47,7 @@ class AutoTrader:
         self.min_claude_confidence: float = min_claude_confidence  # kept for API compat
         self.min_ml_conf: float = min_ml_conf
         self.min_confluence: int = min_confluence
+        self.min_dir_precision: float = min_dir_precision
         self.claude_calls_saved: int = 0   # kept for API compat
         self.retrain_every: int = retrain_every_cycles
         self.monitor_interval: int = 5    # SL/TP/Liq check every 5 seconds
@@ -57,6 +59,7 @@ class AutoTrader:
         self.last_ml_signals: dict[str, dict] = {}
         self.cycle_count: int = 0
         self.model_accuracy: dict[str, float] = {}
+        self.model_dir_precision: dict[str, float] = {}
         self._funding_tick: int = 0
         self.last_retrain_cycle: int = 0
         self.last_retrain_ts: str = None
@@ -118,6 +121,7 @@ class AutoTrader:
         )
         self.training_progress[symbol] = 100
         self.model_accuracy[symbol] = result["accuracy"]
+        self.model_dir_precision[symbol] = result.get("dir_precision", 0.0)
         self._log("INFO",
             f"ML ready — bal_acc {result['accuracy']*100:.1f}% | dir_prec {result.get('dir_precision',0)*100:.1f}% | f1 {result.get('f1_macro',0):.2f} | {result['samples']} samples",
             symbol)
@@ -301,6 +305,11 @@ class AutoTrader:
                 skip_reason = "ML → HOLD"
             elif di_blocked:
                 skip_reason = f"DI={di_score:.2f} — Regime-Shift, kein Entry"
+            elif self.model_dir_precision.get(symbol, 0.0) < self.min_dir_precision:
+                skip_reason = (
+                    f"Modellqualität zu niedrig (dir_precision="
+                    f"{self.model_dir_precision.get(symbol, 0.0):.0%} < {self.min_dir_precision:.0%})"
+                )
             elif conf < MIN_CONF:
                 skip_reason = f"conf={conf:.2f} < {MIN_CONF}"
             elif confluence_score < MIN_CONFLUENCE:
@@ -611,9 +620,11 @@ class AutoTrader:
             "min_claude_confidence": self.min_claude_confidence,
             "min_ml_conf": self.min_ml_conf,
             "min_confluence": self.min_confluence,
+            "min_dir_precision": self.min_dir_precision,
             "claude_calls_saved": self.claude_calls_saved,
             "training_progress": self.training_progress,
             "model_accuracy": self.model_accuracy,
+            "model_dir_precision": self.model_dir_precision,
             "last_decisions": self.last_decisions,
             "last_ml_signals": self.last_ml_signals,
             "risk": risk_status,
