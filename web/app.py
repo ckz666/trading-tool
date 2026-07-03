@@ -10,6 +10,7 @@ from typing import Optional
 
 import config
 from exchange.client import BitgetClient
+from exchange.futures_client import FuturesClient
 from trading.paper import PaperEngine
 from trading.futures_paper import FuturesPaperEngine
 from trading.backtest import run_backtest
@@ -51,7 +52,12 @@ def _add_watch_symbols(symbols: list[str]):
 
 
 async def _price_poll_loop():
-    async with BitgetClient() as client:
+    # Futures client, not spot: AutoTrader positions are USDT-M perpetuals, and
+    # some symbols it trades (e.g. KORU/USDT) don't exist as spot markets at all —
+    # fetching those via the spot client throws BadSymbol. One unhandled failure
+    # used to abort this whole loop early, silently freezing every symbol later
+    # in WATCH_SYMBOLS for good (never reached again, every 5s, forever).
+    async with FuturesClient() as client:
         while True:
             try:
                 # include any symbols the autotrader added dynamically
@@ -61,7 +67,10 @@ async def _price_poll_loop():
                             WATCH_SYMBOLS.append(sym)
 
                 for sym in list(WATCH_SYMBOLS):
-                    ticker = await client.fetch_ticker(sym)
+                    try:
+                        ticker = await client.fetch_ticker(sym)
+                    except Exception:
+                        continue   # don't let one bad symbol block the rest
                     price  = ticker["last"]
                     _price_cache[sym] = {
                         "symbol": sym,
@@ -123,9 +132,12 @@ async def websocket_endpoint(ws: WebSocket):
 @app.get("/api/prices")
 async def get_prices():
     if not _price_cache:
-        async with BitgetClient() as client:
+        async with FuturesClient() as client:
             for sym in WATCH_SYMBOLS:
-                t = await client.fetch_ticker(sym)
+                try:
+                    t = await client.fetch_ticker(sym)
+                except Exception:
+                    continue
                 _price_cache[sym] = {"symbol": sym, "price": t["last"], "change_pct": t.get("percentage", 0)}
     return list(_price_cache.values())
 
