@@ -309,22 +309,31 @@ class FundingHarvester:
                                                f"(~{rate*3*365*100:.1f}% APR) | basis={basis:.3f}%", symbol)
 
                     elif has_position:
+                        # Liquidation and basis-blowout are genuine ongoing risks to the
+                        # hedge itself — checked every poll, no reason to wait.
                         if self.engine.is_liquidated(symbol, perp_price):
                             record = self.engine.close_position(symbol, spot_price, perp_price, "liquidation")
                             self._log("ERROR", f"LIQUIDATED — closed @ net_pnl={record['net_pnl']:+.2f}", symbol)
                         elif basis >= self.max_basis_pct:
                             record = self.engine.close_position(symbol, spot_price, perp_price, "basis_risk")
                             self._log("WARN", f"Basis {basis:.3f}% >= cap, closed @ net_pnl={record['net_pnl']:+.2f}", symbol)
-                        elif rate < self.exit_rate_threshold:
-                            record = self.engine.close_position(symbol, spot_price, perp_price, "rate_dropped")
-                            self._log("TRADE", f"CLOSE rate dropped to {rate*100:.4f}%/8h @ net_pnl={record['net_pnl']:+.2f}", symbol)
                         else:
-                            # settle funding once per settlement window, not every 15-min poll
+                            # The exit-rate check used to run every poll (every 15 min),
+                            # closing positions on short-lived rate noise before a single
+                            # real funding settlement (only 3x/day) ever happened — a
+                            # round-trip in fees for nothing. Now only reconsidered right
+                            # at settlement, using the rate that was actually just paid.
                             now = datetime.utcnow()
-                            if now.hour in self._funding_settle_hours and self._last_settled_hour.get(symbol) != now.hour:
+                            just_settled = (now.hour in self._funding_settle_hours
+                                            and self._last_settled_hour.get(symbol) != now.hour)
+                            if just_settled:
                                 payment = self.engine.accrue_funding(symbol, rate, perp_price)
                                 self._last_settled_hour[symbol] = now.hour
                                 self._log("INFO", f"Funding settled: {payment:+.4f} USDT (rate={rate*100:.4f}%)", symbol)
+                                if rate < self.exit_rate_threshold:
+                                    record = self.engine.close_position(symbol, spot_price, perp_price, "rate_dropped")
+                                    self._log("TRADE", f"CLOSE rate dropped to {rate*100:.4f}%/8h @ "
+                                                       f"net_pnl={record['net_pnl']:+.2f}", symbol)
                 except Exception as e:
                     self._log("ERROR", f"Cycle error: {e}", symbol)
 
