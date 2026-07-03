@@ -165,13 +165,20 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None) -> pd.Dat
     f["squeeze_active"]   = sq["squeeze_active"]
     f["squeeze_momentum"] = sq["squeeze_momentum"]
 
-    # Funding rate (contrarian on-chain feature — positive = longs overextended = bearish)
+    # Funding rate (contrarian on-chain feature — positive = longs overextended = bearish).
+    # Bitget's funding history caps at ~100 records (~33 days) regardless of what's
+    # requested, far short of the price history we can get elsewhere — neutral-fill
+    # rows before funding coverage starts instead of dropping them, same reasoning
+    # as the 4H-indicator warmup above.
     if funding_series is not None and not funding_series.empty:
         aligned = funding_series.reindex(df.index, method="ffill")
         # Normalize: typical rate 0.01% = 1.0, extreme ±5x = ±5.0
-        f["funding_norm"] = (aligned / 0.0001).clip(-5, 5)
+        f["funding_norm"] = ((aligned / 0.0001).clip(-5, 5)).fillna(0.0)
         # Trend: 3-period change (are longs paying more or less?)
-        f["funding_trend"] = aligned.diff(3) / 0.0001
+        f["funding_trend"] = (aligned.diff(3) / 0.0001).fillna(0.0)
+    else:
+        f["funding_norm"]  = 0.0
+        f["funding_trend"] = 0.0
 
     # 4H context (4 features: resampled from this same 1h data, no extra fetch —
     # lets the model see whether the bigger-picture trend agrees with the 1h read).
@@ -233,9 +240,12 @@ def train(df: pd.DataFrame, symbol: str = "BTC/USDT",
     X = features.loc[valid]
     y = labels.loc[valid]
 
-    # ── Outlier removal (IQR × 4.5 per feature — conservative, preserves small datasets) ──
+    # ── Outlier removal (IQR-based, threshold scales with how much data we have —
+    # plenty of samples → filter harder; scarce samples → be lenient, we can't
+    # afford to throw away rows a thin-history symbol doesn't have to spare) ──
+    iqr_mult = 4.5 if len(X) >= 300 else 7.0
     q1 = X.quantile(0.25); q3 = X.quantile(0.75); iqr = q3 - q1
-    mask = ~((X < (q1 - 4.5 * iqr)) | (X > (q3 + 4.5 * iqr))).any(axis=1)
+    mask = ~((X < (q1 - iqr_mult * iqr)) | (X > (q3 + iqr_mult * iqr))).any(axis=1)
     X = X[mask]; y = y[mask]
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)

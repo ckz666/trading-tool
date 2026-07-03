@@ -5,6 +5,7 @@ from datetime import datetime, date
 from typing import Optional
 
 from exchange.futures_client import FuturesClient
+from exchange.binance_data import fetch_ohlcv_binance
 from exchange.market_scanner import get_trending_symbols
 from trading.futures_paper import FuturesPaperEngine, MAINTENANCE_MARGIN
 from trading.risk import RiskManager, RiskConfig
@@ -94,20 +95,38 @@ class AutoTrader:
         self._log("INFO", f"Training ML model — {symbol} {self.timeframe} x{limit}", symbol)
         self.training_progress[symbol] = 0
 
-        async def _fetch(c: FuturesClient):
-            return await asyncio.gather(
-                c.fetch_ohlcv(symbol, self.timeframe, limit),
-                c.fetch_funding_rate_history(symbol, 500),
-            )
+        async def _fetch_funding(c: FuturesClient):
+            return await c.fetch_funding_rate_history(symbol, 500)
+
+        # Bitget's futures OHLCV history caps at ~1200 1h candles (~50 days) no
+        # matter what's requested. Binance Futures has the same pairs with ~4x
+        # more history (verified: ~208 days) — use it for training data only;
+        # live execution, position management and funding stay on Bitget (the
+        # actual trading venue). Falls back to Bitget for symbols too new/small
+        # to be listed on Binance yet.
+        ohlcv = await fetch_ohlcv_binance(symbol, self.timeframe, limit)
 
         # Reuse a shared client when training a batch (train_all) so ccxt's
         # load_markets() happens once, not once per symbol — firing it
         # concurrently per-symbol is what was tripping Bitget's rate limit.
-        if client is not None:
-            ohlcv, funding_raw = await _fetch(client)
+        if not ohlcv:
+            self._log("WARN", f"{symbol} not found on Binance — training on Bitget history instead", symbol)
+            async def _fetch_bitget(c: FuturesClient):
+                return await asyncio.gather(
+                    c.fetch_ohlcv(symbol, self.timeframe, limit),
+                    _fetch_funding(c),
+                )
+            if client is not None:
+                ohlcv, funding_raw = await _fetch_bitget(client)
+            else:
+                async with FuturesClient() as c:
+                    ohlcv, funding_raw = await _fetch_bitget(c)
         else:
-            async with FuturesClient() as c:
-                ohlcv, funding_raw = await _fetch(c)
+            if client is not None:
+                funding_raw = await _fetch_funding(client)
+            else:
+                async with FuturesClient() as c:
+                    funding_raw = await _fetch_funding(c)
         df = _to_df(ohlcv)
         funding_series = _funding_to_series(funding_raw)
 
@@ -127,7 +146,7 @@ class AutoTrader:
             symbol)
         return result
 
-    async def train_all(self, limit: int = 1000, symbols: list = None) -> list:
+    async def train_all(self, limit: int = 3000, symbols: list = None) -> list:
         targets = symbols if symbols is not None else self.symbols
         async with FuturesClient() as client:
             return await asyncio.gather(*[self.train_model(sym, limit, client) for sym in targets])
