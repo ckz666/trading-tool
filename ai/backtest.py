@@ -113,7 +113,7 @@ def run_backtest(
     symbol: str = "BTC/USDT",
     funding_series: pd.Series = None,
     train_pct: float = 0.70,
-    min_confluence: int = 4,
+    min_confluence: int = 7,
     min_conf: float = 0.50,
     atr_sl_mult: float = 1.5,     # SL = entry ± ATR * mult
     atr_tp_mult: float = 3.0,     # TP = entry ± ATR * mult  (R:R = 2)

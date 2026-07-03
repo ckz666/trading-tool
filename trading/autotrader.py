@@ -24,10 +24,11 @@ class AutoTrader:
         risk_config: RiskConfig = None,
         max_leverage: int = 15,
         max_open_positions: int = 3,
+        max_same_direction: int = 3,
         retrain_every_cycles: int = 24,
         min_claude_confidence: float = 0.65,
         min_ml_conf: float = 0.35,
-        min_confluence: int = 5,
+        min_confluence: int = 8,
     ):
         self.symbols = list(symbols or DEFAULT_SYMBOLS)
         self.timeframe = timeframe
@@ -36,6 +37,7 @@ class AutoTrader:
         self.risk = RiskManager(risk_config or RiskConfig())
         self.max_leverage = max_leverage
         self.max_open_positions = max_open_positions
+        self.max_same_direction = max_same_direction
         self.running = False
         self._task: Optional[asyncio.Task] = None
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -281,6 +283,7 @@ class AutoTrader:
 
             action = "hold"
             skip_reason = None
+            trade_mode = "trend"
 
             if has_position:
                 # Already in a position — only manage via SL/TP (handled above)
@@ -302,8 +305,26 @@ class AutoTrader:
                 skip_reason = f"conf={conf:.2f} < {MIN_CONF}"
             elif confluence_score < MIN_CONFLUENCE:
                 skip_reason = f"C={confluence_score}/24 < {MIN_CONFLUENCE}"
+            elif self._same_direction_count(label) >= self.max_same_direction:
+                skip_reason = (
+                    f"Richtungslimit erreicht ({label}: "
+                    f"{self._same_direction_count(label)}/{self.max_same_direction}) — Korrelationsrisiko"
+                )
             else:
                 action = "open_long" if label == "buy" else "open_short"
+
+            # ── Scalp fallback: trend path declined, but the market is ranging
+            # (ADX < 20 → no real trend) — try mean-reversion instead of sitting
+            # idle. Independent of ML confidence/confluence, so it can fire even
+            # when the trend model says HOLD.
+            if skip_reason and not has_position and indicators_quick.get("regime") == "ranging":
+                scalp_label, scalp_reason = self._scalp_signal(indicators_quick)
+                if scalp_label != "hold" and self._same_direction_count(scalp_label) < self.max_same_direction:
+                    action        = "open_long" if scalp_label == "buy" else "open_short"
+                    skip_reason   = None
+                    trade_mode    = "scalp"
+                    label         = scalp_label
+                    confluence_reasons = [scalp_reason]
 
             if skip_reason:
                 decision = {
@@ -318,12 +339,19 @@ class AutoTrader:
                 return
 
             # ── ATR-based SL/TP from indicators ──────────────────────────────────
-            indicators_full = get_indicators(df)
-            atr      = indicators_full.get("atr", price * 0.015)
-            sl_pct   = max((atr * 1.5) / price, 0.005)   # 1.5x ATR, min 0.5%
-            tp_pct   = atr * 3.0 / price                  # 3.0x ATR (R:R 1:2)
-            tp1_pct  = atr * 1.5 / price                  # TP1 at 1.5x ATR (partial close)
-            leverage = self.max_leverage
+            indicators_full = indicators_quick
+            atr = indicators_full.get("atr", price * 0.015)
+            if trade_mode == "scalp":
+                # ranging market — smaller targets sized to the range, not a trend leg
+                sl_pct   = max((atr * 0.5) / price, 0.003)   # 0.5x ATR, min 0.3%
+                tp_pct   = atr * 1.0 / price                  # 1.0x ATR (R:R 1:2)
+                tp1_pct  = atr * 0.5 / price                  # TP1 at 0.5x ATR (partial close)
+                leverage = self._scaled_leverage(self.min_confluence, atr / price)
+            else:
+                sl_pct   = max((atr * 1.5) / price, 0.005)   # 1.5x ATR, min 0.5%
+                tp_pct   = atr * 3.0 / price                  # 3.0x ATR (R:R 1:2)
+                tp1_pct  = atr * 1.5 / price                  # TP1 at 1.5x ATR (partial close)
+                leverage = self._scaled_leverage(confluence_score, atr / price)
 
             # Stop-loss must trigger before liquidation, or it never fires — the position
             # rides to near-total margin loss instead of the sized risk_amount. Cap the SL
@@ -335,13 +363,16 @@ class AutoTrader:
             trail_pct   = sl_pct
 
             reasons_str = " | ".join(confluence_reasons[:4])
+            mode_tag = "SCALP " if trade_mode == "scalp" else ""
             self._log("INFO",
-                f"SIGNAL {action.upper()} | C={confluence_score}/24 | conf={conf:.2f} | SL={sl_pct:.1%} TP={tp_pct:.1%} | {reasons_str}",
+                f"SIGNAL {mode_tag}{action.upper()} | C={confluence_score}/24 | conf={conf:.2f} | SL={sl_pct:.1%} TP={tp_pct:.1%} | {reasons_str}",
                 symbol)
 
+            reasoning = (reasons_str if trade_mode == "scalp" else
+                         f"Rule: C={confluence_score}/24 ≥ {MIN_CONFLUENCE}, conf={conf:.2f} ≥ {MIN_CONF}. {reasons_str}")
             decision = {
-                "action": action, "confidence": conf,
-                "reasoning": f"Rule: C={confluence_score}/24 ≥ {MIN_CONFLUENCE}, conf={conf:.2f} ≥ {MIN_CONF}. {reasons_str}",
+                "action": action, "confidence": conf, "mode": trade_mode,
+                "reasoning": reasoning,
                 "leverage": leverage, "stop_loss_pct": sl_pct, "take_profit_pct": tp_pct,
                 "tp1_pct": tp1_pct, "trailing_sl": trailing_sl, "trail_pct": trail_pct,
                 "confluence_score": confluence_score, "confluence_reasons": confluence_reasons,
@@ -370,18 +401,18 @@ class AutoTrader:
                 record = self.engine.open_position(
                     symbol, "long", amount, price, leverage,
                     price * (1 - sl_pct), price * (1 + tp_pct),
-                    trailing_sl=trailing_sl, trail_pct=trail_pct)
+                    trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode)
                 self._log("TRADE",
-                    f"OPEN LONG {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}) | Liq ${record['liq_price']:,.0f}",
+                    f"OPEN {mode_tag}LONG {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}) | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_long", **record})
 
             elif action == "open_short" and not cur_pos:
                 record = self.engine.open_position(
                     symbol, "short", amount, price, leverage,
                     price * (1 + sl_pct), price * (1 - tp_pct),
-                    trailing_sl=trailing_sl, trail_pct=trail_pct)
+                    trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode)
                 self._log("TRADE",
-                    f"OPEN SHORT {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}) | Liq ${record['liq_price']:,.0f}",
+                    f"OPEN {mode_tag}SHORT {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}) | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_short", **record})
 
             elif action == "close_long" and cur_pos and cur_pos.side == "long":
@@ -571,6 +602,7 @@ class AutoTrader:
             "interval_seconds": self.interval,
             "max_leverage": self.max_leverage,
             "max_open_positions": self.max_open_positions,
+            "max_same_direction": self.max_same_direction,
             "cycle_count": self.cycle_count,
             "retrain_every": self.retrain_every,
             "last_retrain_cycle": self.last_retrain_cycle,
@@ -608,6 +640,44 @@ class AutoTrader:
             t["pnl"] for t in self.engine.trade_history
             if t.get("pnl") is not None and (symbol is None or t.get("symbol") == symbol)
         ]
+
+    def _scalp_signal(self, indicators: dict) -> tuple[str, str]:
+        """Mean-reversion fallback for ranging markets (ADX < 20, no real trend):
+        buy near the lower Bollinger band on RSI oversold, sell near the upper
+        band on RSI overbought. Independent of the ML trend model — pure rule-based,
+        since trend-following signals aren't meaningful when there's no trend."""
+        rsi    = indicators.get("rsi", 50)
+        bb_pct = indicators.get("bb_pct", 0.5)
+        if rsi <= 32 and bb_pct <= 0.15:
+            return "buy", f"Scalp: RSI überverkauft ({rsi:.0f}) nahe unterem BB-Band ({bb_pct:.2f})"
+        if rsi >= 68 and bb_pct >= 0.85:
+            return "sell", f"Scalp: RSI überkauft ({rsi:.0f}) nahe oberem BB-Band ({bb_pct:.2f})"
+        return "hold", ""
+
+    def _same_direction_count(self, label: str) -> int:
+        """Count open positions on the same side as a prospective new entry.
+        Symbols move together (esp. alts vs. BTC) — many positions all betting
+        the same direction isn't diversification, it's one bet repeated."""
+        side = "long" if label == "buy" else "short"
+        return sum(1 for p in self.engine.positions.values() if p.side == side)
+
+    def _scaled_leverage(self, confluence_score: int, atr_pct: float) -> int:
+        """Scale leverage down for marginal signals and volatile symbols instead of
+        always using max_leverage flat. Full leverage requires both strong confluence
+        (>= 2x the min threshold) and below-average volatility (ATR <= 1.5% of price).
+        """
+        conviction = confluence_score / (self.min_confluence * 2) if self.min_confluence else 1.0
+        conviction_factor = max(min(conviction, 1.0), 0.5)
+
+        if atr_pct <= 0.015:
+            vol_factor = 1.0
+        elif atr_pct >= 0.03:
+            vol_factor = 0.5
+        else:
+            vol_factor = 1.0 - 0.5 * (atr_pct - 0.015) / (0.03 - 0.015)
+
+        scaled = self.max_leverage * conviction_factor * vol_factor
+        return max(int(round(scaled)), 2)
 
     def _kelly_risk_pct(self, symbol: str, default_pct: float = 0.015) -> float:
         """Half-Kelly risk-per-trade from realised PnL history (per-symbol, else portfolio-wide).

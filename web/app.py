@@ -224,7 +224,7 @@ class MtfBacktestRequest(BaseModel):
     limit: int = 4000           # Binance: 4000 bars ≈ 166 days 1H; Bitget: max ~1200
     data_source: str = "binance"  # "binance" (more history) or "bitget"
     train_pct: float = 0.70
-    min_confluence: int = 4
+    min_confluence: int = 7
     min_conf: float = 0.50
     atr_sl_mult: float = 1.5
     atr_tp_mult: float = 3.0
@@ -318,10 +318,11 @@ class AutotraderStartRequest(BaseModel):
     max_daily_loss_pct: float = 0.05
     max_leverage: int = 15
     max_open_positions: int = 3
+    max_same_direction: int = 3
     retrain_every_cycles: int = 24
     min_claude_confidence: float = 0.65
     min_ml_conf: float = 0.35
-    min_confluence: int = 5
+    min_confluence: int = 8
 
 
 @app.post("/api/autotrader/start")
@@ -347,6 +348,7 @@ async def start_autotrader(req: AutotraderStartRequest):
             risk_config=risk_cfg,
             max_leverage=req.max_leverage,
             max_open_positions=req.max_open_positions,
+            max_same_direction=req.max_same_direction,
             retrain_every_cycles=req.retrain_every_cycles,
             min_claude_confidence=req.min_claude_confidence,
             min_ml_conf=req.min_ml_conf,
@@ -373,6 +375,7 @@ class AutotraderConfigPatch(BaseModel):
     min_confluence: int = None
     max_leverage: int = None
     max_open_positions: int = None
+    max_same_direction: int = None
 
 @app.patch("/api/autotrader/config")
 def patch_autotrader_config(patch: AutotraderConfigPatch):
@@ -391,6 +394,9 @@ def patch_autotrader_config(patch: AutotraderConfigPatch):
     if patch.max_open_positions is not None:
         autotrader.max_open_positions = patch.max_open_positions
         changed["max_open_positions"] = patch.max_open_positions
+    if patch.max_same_direction is not None:
+        autotrader.max_same_direction = patch.max_same_direction
+        changed["max_same_direction"] = patch.max_same_direction
     return {"status": "updated", "changed": changed}
 
 

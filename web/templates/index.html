@@ -620,13 +620,22 @@ function fmt(n, dec=2) {
   return Number(n).toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec});
 }
 const LOCALE = 'de-DE';
+function toUtcDate(ts) {
+  // Backend sends naive Python isoformat() strings (implicit UTC, no offset).
+  // Without a timezone designator, `new Date(...)` treats them as browser-local
+  // time instead of UTC — mark them explicitly so they convert correctly.
+  if (typeof ts === 'string' && !/[Zz]|[+-]\d\d:\d\d$/.test(ts)) {
+    ts += 'Z';
+  }
+  return new Date(ts);
+}
 function fmtTime(ts) {
   if (!ts) return '—';
-  return new Date(ts).toLocaleTimeString(LOCALE, {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  return toUtcDate(ts).toLocaleTimeString(LOCALE, {hour:'2-digit', minute:'2-digit', second:'2-digit'});
 }
 function fmtDateTime(ts) {
   if (!ts) return '—';
-  return new Date(ts).toLocaleString(LOCALE, {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
+  return toUtcDate(ts).toLocaleString(LOCALE, {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
 }
 
 const TR_ACTION = {
@@ -1054,7 +1063,7 @@ async function pollAutotraderStatus() {
         <div class="hold" style="flex:${ml.probabilities?.hold||1}"></div>
         <div class="buy"  style="flex:${ml.probabilities?.buy||1}"></div>
       </div>
-      <div style="font-weight:600;color:${decColor};font-size:12px;">${tr(TR_ACTION, dec.action||'hold')}${dec.leverage ? ' · '+dec.leverage+'x' : ''}</div>
+      <div style="font-weight:600;color:${decColor};font-size:12px;">${tr(TR_ACTION, dec.action||'hold')}${dec.leverage ? ' · '+dec.leverage+'x' : ''}${dec.mode==='scalp' ? ' <span class="pill pill-blue" style="padding:1px 6px;font-size:9px;">⚡ Scalp</span>' : ''}</div>
       ${ml.regime ? '<div style="font-size:10px;margin-top:3px;color:' + (regColorMap[ml.regime]||'var(--muted)') + '">▸ '+(regimeMap[ml.regime]||ml.regime)+'</div>' : ''}
     `;
     grid.appendChild(card);
@@ -1177,8 +1186,9 @@ function renderPositions(positions) {
     const roe = p.roe_pct || 0;
     const pc  = pnlColor(pnl);
     const row = document.createElement('tr');
+    const modeBadge = p.mode === 'scalp' ? ' <span class="pill pill-blue" title="Ranging-Markt erkannt (ADX&lt;20) — Mean-Reversion statt Trend-Signal">⚡ Scalp</span>' : '';
     row.innerHTML = `
-      <td style="font-weight:700">${p.symbol.replace('/USDT','')}</td>
+      <td style="font-weight:700">${p.symbol.replace('/USDT','')}${modeBadge}</td>
       <td><span class="pill ${isLong?'pill-green':'pill-red'}">${tr(TR_SIDE,p.side)}</span></td>
       <td>${p.amount?.toFixed(6)}</td>
       <td>$${fmt(p.entry_price)}</td>
@@ -1212,10 +1222,11 @@ async function refreshHistory() {
       const pnl = t.pnl;
       const pc  = pnl == null ? 'var(--muted)' : pnlColor(pnl);
       const ac  = t.action?.includes('long') ? 'var(--green)' : t.action?.includes('short') ? 'var(--red)' : 'var(--muted)';
+      const modeBadge = t.mode === 'scalp' ? ' <span class="pill pill-blue">⚡</span>' : '';
       const row = document.createElement('tr');
       row.innerHTML = `
         <td class="muted">${fmtTime(t.ts)}</td>
-        <td style="font-weight:700">${(t.symbol||'—').replace('/USDT','')}</td>
+        <td style="font-weight:700">${(t.symbol||'—').replace('/USDT','')}${modeBadge}</td>
         <td style="color:${ac};font-weight:600">${tr(TR_ACTION, t.action)||'—'}</td>
         <td>$${fmt(t.entry_price||t.price||0)}</td>
         <td>${t.exit_price ? '$'+fmt(t.exit_price) : '—'}</td>

@@ -435,11 +435,15 @@ def _predict_single(df: pd.DataFrame, model_path: str, scaler_path: str) -> dict
     }
 
 
-def detect_market_structure(df: pd.DataFrame, n: int = 5) -> dict:
+def detect_market_structure(df: pd.DataFrame, n: int = 5, min_swing_atr: float = 0.5) -> dict:
     """
     Identify swing highs/lows (pivot points) to classify market structure:
     uptrend (HH+HL), downtrend (LL+LH), expanding, contracting, or sideways.
     n = candles on each side required to confirm a pivot.
+    min_swing_atr = minimum pivot-to-pivot move, as a multiple of the recent
+    average candle range, required to count as meaningfully higher/lower —
+    without this, noise-level wiggles inside a flat range register as a full
+    "trend" just as readily as a real move would.
     """
     if len(df) < n * 2 + 4:
         return {"trend": "unknown", "last_swing_high": 0.0, "last_swing_low": 0.0,
@@ -459,12 +463,14 @@ def detect_market_structure(df: pd.DataFrame, n: int = 5) -> dict:
         if lows[i] == window_l.min():
             pivot_lows.append(float(lows[i]))
 
+    min_swing = float((df["high"] - df["low"]).tail(20).mean()) * min_swing_atr
+
     trend = "sideways"
     if len(pivot_highs) >= 2 and len(pivot_lows) >= 2:
-        hh = pivot_highs[-1] > pivot_highs[-2]  # higher high
-        hl = pivot_lows[-1]  > pivot_lows[-2]   # higher low
-        lh = pivot_highs[-1] < pivot_highs[-2]  # lower high
-        ll = pivot_lows[-1]  < pivot_lows[-2]   # lower low
+        hh = pivot_highs[-1] > pivot_highs[-2] + min_swing  # higher high
+        hl = pivot_lows[-1]  > pivot_lows[-2]  + min_swing  # higher low
+        lh = pivot_highs[-1] < pivot_highs[-2] - min_swing  # lower high
+        ll = pivot_lows[-1]  < pivot_lows[-2]  - min_swing  # lower low
 
         if hh and hl:   trend = "uptrend"
         elif lh and ll: trend = "downtrend"

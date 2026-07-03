@@ -31,6 +31,7 @@ class FuturesPosition:
     sl_high_water: float = 0.0 # best price seen (for trailing)
     take_profit_1: float = 0.0 # partial TP at 50% of full TP distance
     partial_closed: bool = False  # True after TP1 was hit (50% already closed)
+    mode: str = "trend"        # 'trend' (momentum/confluence) | 'scalp' (ranging mean-reversion)
 
     def update_trailing_sl(self, current_price: float) -> bool:
         """Move SL in profitable direction. Returns True if SL moved."""
@@ -87,6 +88,7 @@ class FuturesPosition:
             "trailing_sl": self.trailing_sl,
             "trail_pct": self.trail_pct,
             "sl_high_water": round(self.sl_high_water, 4),
+            "mode": self.mode,
         }
 
 
@@ -156,6 +158,7 @@ class FuturesPaperEngine:
                     sl_high_water    = d.get("sl_high_water", 0.0),
                     take_profit_1    = d.get("take_profit_1", 0.0),
                     partial_closed   = d.get("partial_closed", False),
+                    mode             = d.get("mode", "trend"),
                 )
             print(f"[FuturesPaper] Loaded state: balance={self.balance:.2f} USDT, "
                   f"{len(self.positions)} open pos, {len(self.trade_history)} trades")
@@ -185,6 +188,7 @@ class FuturesPaperEngine:
         take_profit: float,
         trailing_sl: bool = False,
         trail_pct: float = 0.02,
+        mode: str = "trend",
     ) -> dict:
         if symbol in self.positions:
             raise ValueError(f"Position already open for {symbol}. Close first.")
@@ -211,6 +215,7 @@ class FuturesPaperEngine:
             stop_loss=stop_loss, take_profit=take_profit,
             trailing_sl=trailing_sl, trail_pct=trail_pct,
             sl_high_water=price, take_profit_1=round(tp1, 4),
+            mode=mode,
         )
         self.positions[symbol] = pos
 
@@ -220,6 +225,7 @@ class FuturesPaperEngine:
             "symbol": symbol, "amount": amount, "price": price,
             "leverage": leverage, "margin": margin, "fee": fee,
             "liq_price": liq_price, "sl": stop_loss, "tp": take_profit,
+            "mode": mode,
             "ts": datetime.now().isoformat(),
         }
         self.trade_history.append(record)
@@ -246,6 +252,7 @@ class FuturesPaperEngine:
             "entry_price": pos.entry_price, "exit_price": price,
             "leverage": pos.leverage, "pnl": round(pnl_net, 4),
             "roe_pct": round(pos.roe(price), 2),
+            "mode": pos.mode,
             "ts": datetime.now().isoformat(),
         }
         self.trade_history.append(record)
@@ -300,6 +307,7 @@ class FuturesPaperEngine:
             "leverage":    pos.leverage,
             "pnl":         round(pnl_net, 4),
             "roe_pct":     round(pnl_net / orig_margin * 100, 2) if orig_margin else 0,
+            "mode":        pos.mode,
             "ts":          datetime.now().isoformat(),
         }
         self.trade_history.append(record)
