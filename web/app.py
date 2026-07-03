@@ -27,6 +27,7 @@ paper = PaperEngine()
 futures_paper = FuturesPaperEngine()
 alert_mgr = AlertManager()
 autotrader: AutoTrader = None
+_autotrader_starting = False
 _price_cache: dict[str, dict] = {}
 _ws_clients: list[WebSocket] = []
 
@@ -325,29 +326,37 @@ class AutotraderStartRequest(BaseModel):
 
 @app.post("/api/autotrader/start")
 async def start_autotrader(req: AutotraderStartRequest):
-    global autotrader, futures_paper
-    if autotrader and autotrader.running:
+    global autotrader, futures_paper, _autotrader_starting
+    # autotrader.running only flips True after the (multi-second) initial training
+    # finishes, so two near-simultaneous requests can both pass that check and spin
+    # up duplicate instances. _autotrader_starting is set synchronously, before any
+    # await, so a second request lands on it before we ever release control.
+    if _autotrader_starting or (autotrader and autotrader.running):
         raise HTTPException(400, "AutoTrader already running")
-    risk_cfg = RiskConfig(
-        max_position_pct=req.max_position_pct,
-        max_daily_loss_pct=req.max_daily_loss_pct,
-    )
-    autotrader = AutoTrader(
-        symbols=req.symbols,
-        timeframe=req.timeframe,
-        interval_seconds=req.interval_seconds,
-        engine=futures_paper,
-        risk_config=risk_cfg,
-        max_leverage=req.max_leverage,
-        max_open_positions=req.max_open_positions,
-        retrain_every_cycles=req.retrain_every_cycles,
-        min_claude_confidence=req.min_claude_confidence,
-        min_ml_conf=req.min_ml_conf,
-        min_confluence=req.min_confluence,
-    )
-    _add_watch_symbols(req.symbols)
-    train_results = await autotrader.startup()
-    return {"status": "started", "models": train_results}
+    _autotrader_starting = True
+    try:
+        risk_cfg = RiskConfig(
+            max_position_pct=req.max_position_pct,
+            max_daily_loss_pct=req.max_daily_loss_pct,
+        )
+        autotrader = AutoTrader(
+            symbols=req.symbols,
+            timeframe=req.timeframe,
+            interval_seconds=req.interval_seconds,
+            engine=futures_paper,
+            risk_config=risk_cfg,
+            max_leverage=req.max_leverage,
+            max_open_positions=req.max_open_positions,
+            retrain_every_cycles=req.retrain_every_cycles,
+            min_claude_confidence=req.min_claude_confidence,
+            min_ml_conf=req.min_ml_conf,
+            min_confluence=req.min_confluence,
+        )
+        _add_watch_symbols(req.symbols)
+        train_results = await autotrader.startup()
+        return {"status": "started", "models": train_results}
+    finally:
+        _autotrader_starting = False
 
 
 @app.post("/api/autotrader/stop")

@@ -85,14 +85,24 @@ class AutoTrader:
         print(f"[{entry['ts'][11:19]}] [{level}] {tag}{msg}")
 
     # ── model training ────────────────────────────────────────────────────────
-    async def train_model(self, symbol: str, limit: int = 2000) -> dict:
+    async def train_model(self, symbol: str, limit: int = 2000, client: FuturesClient = None) -> dict:
         self._log("INFO", f"Training ML model — {symbol} {self.timeframe} x{limit}", symbol)
         self.training_progress[symbol] = 0
-        async with FuturesClient() as client:
-            ohlcv, funding_raw = await asyncio.gather(
-                client.fetch_ohlcv(symbol, self.timeframe, limit),
-                client.fetch_funding_rate_history(symbol, 500),
+
+        async def _fetch(c: FuturesClient):
+            return await asyncio.gather(
+                c.fetch_ohlcv(symbol, self.timeframe, limit),
+                c.fetch_funding_rate_history(symbol, 500),
             )
+
+        # Reuse a shared client when training a batch (train_all) so ccxt's
+        # load_markets() happens once, not once per symbol — firing it
+        # concurrently per-symbol is what was tripping Bitget's rate limit.
+        if client is not None:
+            ohlcv, funding_raw = await _fetch(client)
+        else:
+            async with FuturesClient() as c:
+                ohlcv, funding_raw = await _fetch(c)
         df = _to_df(ohlcv)
         funding_series = _funding_to_series(funding_raw)
 
@@ -113,7 +123,8 @@ class AutoTrader:
 
     async def train_all(self, limit: int = 1000, symbols: list = None) -> list:
         targets = symbols if symbols is not None else self.symbols
-        return await asyncio.gather(*[self.train_model(sym, limit) for sym in targets])
+        async with FuturesClient() as client:
+            return await asyncio.gather(*[self.train_model(sym, limit, client) for sym in targets])
 
     # ── single symbol cycle ───────────────────────────────────────────────────
     async def _run_symbol(self, client: FuturesClient, symbol: str):
@@ -481,10 +492,15 @@ class AutoTrader:
                     # ── auto-retrain ──
                     if self.retrain_every > 0 and self.cycle_count > 1 and self.cycle_count % self.retrain_every == 0:
                         self._log("INFO", f"Auto-retrain triggered (every {self.retrain_every} cycles)")
-                        await self.train_all()
-                        self.last_retrain_cycle = self.cycle_count
-                        self.last_retrain_ts    = datetime.now().isoformat()
-                        self.next_retrain_cycle = self.cycle_count + self.retrain_every
+                        try:
+                            await self.train_all()
+                            self.last_retrain_cycle = self.cycle_count
+                            self.last_retrain_ts    = datetime.now().isoformat()
+                            self.next_retrain_cycle = self.cycle_count + self.retrain_every
+                        except Exception as e:
+                            # a transient fetch/rate-limit error here must not kill the whole
+                            # trading loop — skip this retrain, keep the existing models
+                            self._log("WARN", f"Auto-retrain fehlgeschlagen, behalte alte Modelle: {e}", "ALL")
 
                     await asyncio.gather(
                         *[self._run_symbol(client, sym) for sym in self.symbols],
