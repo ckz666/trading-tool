@@ -19,7 +19,8 @@ _EXCLUDE = {
     "XAU", "XAG", "OIL", "BRN", "WTI",                        # commodities
 }
 
-MIN_VOLUME_USDT = 50_000_000   # $50M 24h — Bitget has fewer pairs than Binance
+MIN_VOLUME_USDT = 20_000_000   # $20M 24h — lower catches more small/new-coin momentum,
+                                # still filters out the thinnest (sub-$10M) pairs
 
 
 def _parse_tickers(raw: list) -> list[dict]:
@@ -85,7 +86,7 @@ async def get_trending_symbols(
 
 async def get_all_market_overview(
     top_n: int = 20,
-    min_volume: float = 50_000_000,
+    min_volume: float = MIN_VOLUME_USDT,
 ) -> list[dict]:
     """Top gainers + losers for UI display."""
     tickers = await _fetch_bitget_tickers()

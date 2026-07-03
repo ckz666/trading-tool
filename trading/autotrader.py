@@ -471,7 +471,7 @@ class AutoTrader:
     async def _refresh_symbols(self):
         """Replace watchlist with top trending USDT-perp pairs, keeping anchors + open positions."""
         try:
-            trending = await get_trending_symbols(top_n=self.max_symbols + 2, min_volume=75_000_000)
+            trending = await get_trending_symbols(top_n=self.max_symbols + 2, min_volume=20_000_000)
             self.trending_data = trending
             if not trending:
                 return
