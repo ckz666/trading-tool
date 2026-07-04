@@ -218,12 +218,21 @@ class FundingHarvestEngine:
         return perp_price >= pos.liquidation_price
 
     def portfolio_value(self, prices: dict[str, dict]) -> float:
-        """prices: {symbol: {"spot": px, "perp": px}}"""
+        """prices: {symbol: {"spot": px, "perp": px}}
+
+        The spot leg's full current market value must be added back — opening
+        a position deducts the entire notional from balance to buy real spot
+        holdings, not just margin. unrealized_price_pnl() only returns the
+        *change* since entry, so using margin + that delta alone silently
+        drops the spot leg's principal from the total (looked like ~34%
+        of the paper portfolio had vanished; it was just uncounted, not lost)."""
         total = self.balance
         for sym, pos in self.positions.items():
             p = prices.get(sym)
             if p:
-                total += pos.margin + pos.unrealized_price_pnl(p["spot"], p["perp"])
+                spot_value = pos.spot_qty * p["spot"]
+                perp_pnl = (pos.entry_perp_price - p["perp"]) * pos.perp_qty
+                total += spot_value + pos.margin + perp_pnl
         return max(total, 0)
 
     def status(self, prices: dict[str, dict] = None) -> dict:
