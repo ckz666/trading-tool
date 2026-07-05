@@ -20,6 +20,7 @@ import pandas as pd
 
 from exchange.futures_client import FuturesClient
 from ai.ml_signal import get_indicators
+from trading.wallet import SharedWallet
 
 MAKER_FEE = 0.0002   # matches futures_paper.py's MAKER_FEE
 STATE_FILE = "data/grid_state.json"
@@ -36,9 +37,8 @@ class GridEngine:
     """Paper P&L bookkeeping for one grid per symbol. No strategy/regime
     logic here — that lives in GridTrader below."""
 
-    def __init__(self, initial_balance: float = 10000.0):
-        self.initial_balance = initial_balance
-        self.balance = initial_balance
+    def __init__(self, wallet: SharedWallet = None, initial_balance: float = 10000.0):
+        self.wallet = wallet or SharedWallet(initial_balance)
         self.grids: dict[str, dict] = {}
         self.trade_history: list[dict] = []
         self.total_realized_pnl: float = 0.0
@@ -48,8 +48,6 @@ class GridEngine:
     def _save(self):
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         state = {
-            "balance": self.balance,
-            "initial_balance": self.initial_balance,
             "total_realized_pnl": self.total_realized_pnl,
             "total_fees_paid": self.total_fees_paid,
             "trade_history": self.trade_history,
@@ -60,6 +58,7 @@ class GridEngine:
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
+        self.wallet._save()
 
     def _load(self):
         if not os.path.exists(STATE_FILE):
@@ -67,13 +66,11 @@ class GridEngine:
         try:
             with open(STATE_FILE) as f:
                 state = json.load(f)
-            self.balance = state.get("balance", self.initial_balance)
-            self.initial_balance = state.get("initial_balance", self.initial_balance)
             self.total_realized_pnl = state.get("total_realized_pnl", 0.0)
             self.total_fees_paid = state.get("total_fees_paid", 0.0)
             self.trade_history = state.get("trade_history", [])
             self.grids = state.get("grids", {})
-            print(f"[Grid] Loaded state: balance={self.balance:.2f} USDT, "
+            print(f"[Grid] Loaded state: wallet balance={self.wallet.balance:.2f} USDT, "
                   f"{len(self.grids)} active grids, {len(self.trade_history)} trades")
         except Exception as e:
             print(f"[Grid] Could not load state: {e} — starting fresh")
@@ -82,8 +79,8 @@ class GridEngine:
                   capital: float) -> dict:
         if symbol in self.grids:
             raise ValueError(f"Grid already active for {symbol}")
-        if capital > self.balance:
-            raise ValueError(f"Insufficient balance: need {capital:.2f}, have {self.balance:.2f}")
+        if capital > self.wallet.balance:
+            raise ValueError(f"Insufficient balance: need {capital:.2f}, have {self.wallet.balance:.2f}")
         if lower >= upper or n_levels < 2:
             raise ValueError("Invalid grid range/levels")
 
@@ -91,7 +88,7 @@ class GridEngine:
         lines = [round(lower * step ** i, 8) for i in range(n_levels + 1)]
         capital_per_level = capital / n_levels
 
-        self.balance -= capital
+        self.wallet.balance -= capital
         grid = {
             "symbol": symbol, "lower": lower, "upper": upper, "n_levels": n_levels,
             "lines": lines,
@@ -188,7 +185,7 @@ class GridEngine:
                 self.total_fees_paid += fee
                 self.total_realized_pnl += pnl
 
-        self.balance += max(grid["reserve"], 0)
+        self.wallet.balance += max(grid["reserve"], 0)
 
         record = {
             "id": str(uuid.uuid4())[:8], "action": "close_grid", "reason": reason, "symbol": symbol,
@@ -208,7 +205,10 @@ class GridEngine:
         return grid["reserve"] + inventory_value
 
     def portfolio_value(self, prices: dict[str, float]) -> float:
-        total = self.balance
+        """Shared-wallet balance + this engine's own grids only — not the
+        true account total when other engines also hold positions, see
+        /api/portfolio/total for that."""
+        total = self.wallet.balance
         for sym in self.grids:
             if sym in prices:
                 total += self.grid_value(sym, prices[sym])
@@ -228,7 +228,7 @@ class GridEngine:
                 "in_range": (g["lower"] <= price <= g["upper"]) if price else None,
             }
         return {
-            "balance": round(self.balance, 2),
+            "balance": round(self.wallet.balance, 2),
             "portfolio_value": round(self.portfolio_value(prices), 2),
             "total_realized_pnl": round(self.total_realized_pnl, 2),
             "total_fees_paid": round(self.total_fees_paid, 2),
@@ -311,7 +311,7 @@ class GridTrader:
                     elif regime == "ranging":
                         lower = price - atr * self.atr_range_mult
                         upper = price + atr * self.atr_range_mult
-                        capital = self.engine.balance * self.capital_per_grid_pct
+                        capital = self.engine.wallet.balance * self.capital_per_grid_pct
                         if capital > 50 and lower > 0:
                             self.engine.open_grid(symbol, lower, upper, self.n_levels, capital)
                             self._log("TRADE", f"OPEN GRID {lower:.4f}-{upper:.4f} "

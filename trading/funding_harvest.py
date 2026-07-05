@@ -16,6 +16,7 @@ from typing import Optional
 
 from exchange.client import BitgetClient
 from exchange.futures_client import FuturesClient
+from trading.wallet import SharedWallet
 
 SPOT_FEE = 0.001        # 0.1% taker, matches trading/paper.py
 PERP_TAKER_FEE = 0.0006  # matches trading/futures_paper.py
@@ -73,9 +74,8 @@ class FundingHarvestEngine:
     """Paper P&L bookkeeping for paired spot+perp positions. No strategy logic
     here — that lives in FundingHarvester below."""
 
-    def __init__(self, initial_balance: float = 10000.0):
-        self.initial_balance = initial_balance
-        self.balance = initial_balance
+    def __init__(self, wallet: SharedWallet = None, initial_balance: float = 10000.0):
+        self.wallet = wallet or SharedWallet(initial_balance)
         self.positions: dict[str, HarvestPosition] = {}
         self.trade_history: list[dict] = []
         self.total_funding_earned = 0.0
@@ -85,8 +85,6 @@ class FundingHarvestEngine:
     def _save(self):
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         state = {
-            "balance": self.balance,
-            "initial_balance": self.initial_balance,
             "total_funding_earned": self.total_funding_earned,
             "total_fees_paid": self.total_fees_paid,
             "trade_history": self.trade_history,
@@ -97,6 +95,7 @@ class FundingHarvestEngine:
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
+        self.wallet._save()
 
     def _load(self):
         if not os.path.exists(STATE_FILE):
@@ -104,8 +103,6 @@ class FundingHarvestEngine:
         try:
             with open(STATE_FILE) as f:
                 state = json.load(f)
-            self.balance = state.get("balance", self.initial_balance)
-            self.initial_balance = state.get("initial_balance", self.initial_balance)
             self.total_funding_earned = state.get("total_funding_earned", 0.0)
             self.total_fees_paid = state.get("total_fees_paid", 0.0)
             self.trade_history = state.get("trade_history", [])
@@ -117,7 +114,7 @@ class FundingHarvestEngine:
                     funding_accrued=d.get("funding_accrued", 0.0), fees_paid=d.get("fees_paid", 0.0),
                     opened_at=d.get("opened_at", ""),
                 )
-            print(f"[FundingHarvest] Loaded state: balance={self.balance:.2f} USDT, "
+            print(f"[FundingHarvest] Loaded state: wallet balance={self.wallet.balance:.2f} USDT, "
                   f"{len(self.positions)} open pos, {len(self.trade_history)} trades")
         except Exception as e:
             print(f"[FundingHarvest] Could not load state: {e} — starting fresh")
@@ -134,13 +131,13 @@ class FundingHarvestEngine:
         perp_fee = notional_usdt * PERP_TAKER_FEE
 
         total_cost = notional_usdt + spot_fee + margin + perp_fee
-        if self.balance < total_cost:
-            raise ValueError(f"Insufficient balance: need {total_cost:.2f}, have {self.balance:.2f}")
+        if self.wallet.balance < total_cost:
+            raise ValueError(f"Insufficient balance: need {total_cost:.2f}, have {self.wallet.balance:.2f}")
 
         # short perp liquidation: price rises past this and the perp leg gets force-closed
         liq_price = perp_price * (1 + 1 / leverage - MAINTENANCE_MARGIN)
 
-        self.balance -= total_cost
+        self.wallet.balance -= total_cost
         fees = spot_fee + perp_fee
         self.total_fees_paid += fees
 
@@ -173,7 +170,7 @@ class FundingHarvestEngine:
         payment = notional * funding_rate
         pos.funding_accrued += payment
         self.total_funding_earned += payment
-        self.balance += payment
+        self.wallet.balance += payment
         pos.last_funding_check = datetime.now().isoformat()
         self._save()
         return payment
@@ -195,7 +192,7 @@ class FundingHarvestEngine:
         self.total_fees_paid += fees
 
         returned = pos.margin + perp_pnl + spot_proceeds - spot_fee
-        self.balance += max(returned, 0)
+        self.wallet.balance += max(returned, 0)
 
         net_pnl = pos.funding_accrued + spot_pnl + perp_pnl
 
@@ -225,8 +222,11 @@ class FundingHarvestEngine:
         holdings, not just margin. unrealized_price_pnl() only returns the
         *change* since entry, so using margin + that delta alone silently
         drops the spot leg's principal from the total (looked like ~34%
-        of the paper portfolio had vanished; it was just uncounted, not lost)."""
-        total = self.balance
+        of the paper portfolio had vanished; it was just uncounted, not lost).
+        Shared-wallet balance + this engine's own positions only — not the
+        true account total when other engines also hold positions, see
+        /api/portfolio/total for that."""
+        total = self.wallet.balance
         for sym, pos in self.positions.items():
             p = prices.get(sym)
             if p:
@@ -238,7 +238,7 @@ class FundingHarvestEngine:
     def status(self, prices: dict[str, dict] = None) -> dict:
         prices = prices or {}
         return {
-            "balance": round(self.balance, 2),
+            "balance": round(self.wallet.balance, 2),
             "portfolio_value": round(self.portfolio_value(prices), 2),
             "total_funding_earned": round(self.total_funding_earned, 2),
             "total_fees_paid": round(self.total_fees_paid, 2),
@@ -327,8 +327,8 @@ class FundingHarvester:
                         # size off free balance, not total equity — keeps sizing simple and
                         # avoids needing live prices for every other open position just to
                         # size this one entry
-                        notional = min(self.engine.balance * self.max_position_pct,
-                                        self.engine.balance * 0.9)
+                        notional = min(self.engine.wallet.balance * self.max_position_pct,
+                                        self.engine.wallet.balance * 0.9)
                         if notional > 50:  # dust guard
                             record = self.engine.open_position(symbol, notional, spot_price, perp_price, self.leverage)
                             self._settlement_count[symbol] = 0

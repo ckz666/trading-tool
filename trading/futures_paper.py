@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+from trading.wallet import SharedWallet
+
 MAKER_FEE = 0.0002
 TAKER_FEE = 0.0006
 MAINTENANCE_MARGIN = 0.005  # 0.5%
@@ -100,9 +102,8 @@ def calc_liquidation_price(entry: float, side: str, leverage: int) -> float:
 
 
 class FuturesPaperEngine:
-    def __init__(self, initial_balance: float = 10000.0):
-        self.initial_balance = initial_balance
-        self.balance = initial_balance
+    def __init__(self, wallet: SharedWallet = None, initial_balance: float = 10000.0):
+        self.wallet = wallet or SharedWallet(initial_balance)
         self.positions: dict[str, FuturesPosition] = {}
         self.trade_history: list[dict] = []
         self.total_pnl: float = 0.0
@@ -110,12 +111,12 @@ class FuturesPaperEngine:
         self._load()
 
     # ── Persistence ───────────────────────────────────────────────────────────
+    # Balance lives in the shared wallet now, not here — this file only
+    # persists this engine's own positions/history.
 
     def _save(self):
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         state = {
-            "balance": self.balance,
-            "initial_balance": self.initial_balance,
             "total_pnl": self.total_pnl,
             "trade_history": self.trade_history,
             "equity_history": self.equity_history[-2000:],
@@ -128,6 +129,7 @@ class FuturesPaperEngine:
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)   # atomic write
+        self.wallet._save()
 
     def _load(self):
         if not os.path.exists(STATE_FILE):
@@ -135,8 +137,6 @@ class FuturesPaperEngine:
         try:
             with open(STATE_FILE) as f:
                 state = json.load(f)
-            self.balance         = state.get("balance", self.initial_balance)
-            self.initial_balance = state.get("initial_balance", self.initial_balance)
             self.total_pnl       = state.get("total_pnl", 0.0)
             self.trade_history   = state.get("trade_history", [])
             self.equity_history  = state.get("equity_history", [])
@@ -160,18 +160,18 @@ class FuturesPaperEngine:
                     partial_closed   = d.get("partial_closed", False),
                     mode             = d.get("mode", "trend"),
                 )
-            print(f"[FuturesPaper] Loaded state: balance={self.balance:.2f} USDT, "
+            print(f"[FuturesPaper] Loaded state: wallet balance={self.wallet.balance:.2f} USDT, "
                   f"{len(self.positions)} open pos, {len(self.trade_history)} trades")
         except Exception as e:
             print(f"[FuturesPaper] Could not load state: {e} — starting fresh")
 
-    def reset(self, initial_balance: float = 10000.0):
-        """Wipe state and start fresh."""
-        self.balance = initial_balance
-        self.initial_balance = initial_balance
+    def reset(self, initial_balance: float = None):
+        """Wipe this engine's own state. Does NOT touch the shared wallet
+        balance — call wallet.reset() separately if you want that too."""
         self.positions = {}
         self.trade_history = []
         self.total_pnl = 0.0
+        self.equity_history = []
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
 
@@ -197,11 +197,11 @@ class FuturesPaperEngine:
         margin = notional / leverage
         fee = notional * TAKER_FEE
 
-        if self.balance < margin + fee:
-            raise ValueError(f"Insufficient margin: need {margin+fee:.2f} USDT, have {self.balance:.2f}")
+        if self.wallet.balance < margin + fee:
+            raise ValueError(f"Insufficient margin: need {margin+fee:.2f} USDT, have {self.wallet.balance:.2f}")
 
         liq_price = calc_liquidation_price(price, side, leverage)
-        self.balance -= (margin + fee)
+        self.wallet.balance -= (margin + fee)
 
         # Partial TP1 at 50% of full TP distance from entry
         if side == "long":
@@ -241,7 +241,7 @@ class FuturesPaperEngine:
         fee = pos.amount * price * TAKER_FEE
         pnl_net = pnl - fee - pos.funding_paid
         returned_margin = pos.margin + pnl_net
-        self.balance += max(returned_margin, 0)
+        self.wallet.balance += max(returned_margin, 0)
         self.total_pnl += pnl_net
 
         record = {
@@ -288,7 +288,7 @@ class FuturesPaperEngine:
 
         orig_margin = pos.margin
         returned = orig_margin * close_fraction + pnl_net
-        self.balance  += max(returned, 0)
+        self.wallet.balance += max(returned, 0)
         self.total_pnl += pnl_net
 
         pos.amount        = remain_amount
@@ -349,7 +349,10 @@ class FuturesPaperEngine:
                                    self.equity_history[-500:]
 
     def portfolio_value(self, prices: dict) -> float:
-        total = self.balance
+        """Shared-wallet balance + this engine's own open positions. Not the
+        true account total when other engines also hold positions — see
+        /api/portfolio/total for that."""
+        total = self.wallet.balance
         for sym, pos in self.positions.items():
             if sym in prices:
                 total += pos.margin + pos.unrealized_pnl(prices[sym])
@@ -364,7 +367,7 @@ class FuturesPaperEngine:
     def status(self, prices: dict = None) -> dict:
         prices = prices or {}
         return {
-            "balance": round(self.balance, 2),
+            "balance": round(self.wallet.balance, 2),
             "portfolio_value": round(self.portfolio_value(prices), 2),
             "total_pnl": round(self.total_pnl, 2),
             "open_positions": len(self.positions),

@@ -18,6 +18,7 @@ from ai.backtest import run_backtest as run_mtf_backtest
 from trading.autotrader import AutoTrader
 from trading.funding_harvest import FundingHarvestEngine, FundingHarvester
 from trading.grid import GridEngine, GridTrader
+from trading.wallet import SharedWallet
 from trading.risk import RiskConfig
 from strategies.base import STRATEGIES
 from monitoring.alerts import AlertManager
@@ -27,14 +28,18 @@ from exchange.market_scanner import get_trending_symbols, get_all_market_overvie
 
 # ── shared state ─────────────────────────────────────────────────────────────
 paper = PaperEngine()
-futures_paper = FuturesPaperEngine()
+# One real pool of capital shared by the three automated engines (AutoTrader,
+# Funding Harvest, Grid) — opening a position in any one of them draws down
+# the same balance, instead of each running its own independent account.
+shared_wallet = SharedWallet()
+futures_paper = FuturesPaperEngine(wallet=shared_wallet)
 alert_mgr = AlertManager()
 autotrader: AutoTrader = None
 _autotrader_starting = False
-funding_harvest_engine = FundingHarvestEngine()
+funding_harvest_engine = FundingHarvestEngine(wallet=shared_wallet)
 funding_harvester: FundingHarvester = None
 _funding_harvester_starting = False
-grid_engine = GridEngine()
+grid_engine = GridEngine(wallet=shared_wallet)
 grid_trader: GridTrader = None
 _grid_trader_starting = False
 _price_cache: dict[str, dict] = {}
@@ -633,6 +638,51 @@ def grid_log(limit: int = 50):
     if not grid_trader:
         return []
     return grid_trader.log[-limit:]
+
+
+@app.get("/api/portfolio/total")
+async def portfolio_total():
+    """The true combined total across the shared wallet — the individual
+    engines' own portfolio_value() only adds back their own positions, so
+    summing those directly would double-count the shared balance."""
+    futures_prices = {sym: d["price"] for sym, d in _price_cache.items()}
+    futures_value = futures_paper.portfolio_value(futures_prices)
+    futures_positions_value = futures_value - shared_wallet.balance
+
+    harvest_prices = {}
+    if funding_harvest_engine.positions:
+        async with BitgetClient() as spot, FuturesClient() as perp:
+            for sym in funding_harvest_engine.positions:
+                try:
+                    s, p = await asyncio.gather(spot.fetch_ticker(sym), perp.fetch_ticker(sym))
+                    harvest_prices[sym] = {"spot": s["last"], "perp": p["last"]}
+                except Exception:
+                    continue
+    harvest_value = funding_harvest_engine.portfolio_value(harvest_prices)
+    harvest_positions_value = harvest_value - shared_wallet.balance
+
+    grid_prices = {}
+    if grid_engine.grids:
+        async with FuturesClient() as client:
+            for sym in grid_engine.grids:
+                try:
+                    t = await client.fetch_ticker(sym)
+                    grid_prices[sym] = t["last"]
+                except Exception:
+                    continue
+    grid_value = grid_engine.portfolio_value(grid_prices)
+    grid_positions_value = grid_value - shared_wallet.balance
+
+    total = shared_wallet.balance + futures_positions_value + harvest_positions_value + grid_positions_value
+    return {
+        "shared_balance": round(shared_wallet.balance, 2),
+        "initial_balance": shared_wallet.initial_balance,
+        "autotrader_positions_value": round(futures_positions_value, 2),
+        "funding_harvest_positions_value": round(harvest_positions_value, 2),
+        "grid_positions_value": round(grid_positions_value, 2),
+        "total_portfolio_value": round(total, 2),
+        "total_pnl": round(total - shared_wallet.initial_balance, 2),
+    }
 
 
 @app.get("/api/market/trending")
