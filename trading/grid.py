@@ -251,7 +251,13 @@ class GridTrader:
         symbols: list[str] = None,
         engine: GridEngine = None,
         interval_seconds: int = 300,
-        timeframe: str = "1h",
+        # 1h ADX rarely dipped under the ranging threshold (20) — observed in
+        # prod as BTC/ETH/XRP sitting in trending/transitioning for ~7h
+        # straight, only SOL ever getting a grid. 15m reacts faster and should
+        # catch more (shorter-lived) ranging windows; ATR-sized range and
+        # stop-loss scale down naturally with it since both derive from the
+        # same timeframe's indicators.
+        timeframe: str = "15m",
         n_levels: int = 10,
         atr_range_mult: float = 2.0,        # grid spans price +/- atr_range_mult*ATR
         capital_per_grid_pct: float = 0.20,  # fraction of free balance allocated per new grid

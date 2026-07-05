@@ -572,7 +572,7 @@ def funding_harvest_log(limit: int = 50):
 class GridStartRequest(BaseModel):
     symbols: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
     interval_seconds: int = 300
-    timeframe: str = "1h"
+    timeframe: str = "15m"
     n_levels: int = 10
     atr_range_mult: float = 2.0
     capital_per_grid_pct: float = 0.20
