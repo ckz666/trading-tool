@@ -260,8 +260,23 @@ class FundingHarvester:
         symbols: list[str] = None,
         engine: FundingHarvestEngine = None,
         interval_seconds: int = 900,       # scan every 15 min
-        entry_rate_threshold: float = 0.00008,   # ~8.8% APR, covers round-trip fees with margin
-        exit_rate_threshold: float = 0.00002,    # hysteresis: exit well below entry, avoid flip-flop
+        # Round-trip cost is 2x(SPOT_FEE + PERP_TAKER_FEE) = 0.32% of notional (open + close,
+        # each leg both sides). At the old entry_rate_threshold (0.008%/8h) breakeven required
+        # 0.32/0.008 = 40 settlements (~13 days) — but the old exit_rate_threshold (0.002%/8h)
+        # let real rate noise trigger an exit after just 1 settlement almost every time, so
+        # positions realized ~$0.20 in funding against $3-6 in fees on nearly every trade
+        # (confirmed against 18 closed round-trips in prod: 31.19 USDT fees vs 0.59 USDT funding
+        # earned in total). Fixed three ways together: (1) raise the entry bar so only rates
+        # that can plausibly cover the round trip get taken, (2) widen the exit hysteresis so a
+        # brief dip back toward zero doesn't immediately close a position, (3) enforce a minimum
+        # number of settlements before the rate-exit is even evaluated, so fees get a chance to
+        # amortize regardless of short-term rate noise. min_hold_settlements=13 at
+        # entry_rate_threshold=0.025%/8h means the guaranteed-minimum hold alone (13 x 0.025%
+        # = 0.325%) already clears the 0.32% round-trip cost even in the worst case where the
+        # rate does nothing but sit right at the entry floor the whole time.
+        entry_rate_threshold: float = 0.00025,   # ~27% APR — must plausibly clear the 0.32% round trip
+        exit_rate_threshold: float = 0.0,        # only exit once the edge is genuinely gone, not just dipping
+        min_hold_settlements: int = 13,          # ~4.3 days — floor lets fees amortize before any rate-exit
         max_basis_pct: float = 0.5,        # close if spot/perp diverge beyond this — hedge is failing
         max_position_pct: float = 0.25,    # cap per-symbol notional as a fraction of equity
         leverage: int = 2,
@@ -271,6 +286,7 @@ class FundingHarvester:
         self.interval = interval_seconds
         self.entry_rate_threshold = entry_rate_threshold
         self.exit_rate_threshold = exit_rate_threshold
+        self.min_hold_settlements = min_hold_settlements
         self.max_basis_pct = max_basis_pct
         self.max_position_pct = max_position_pct
         self.leverage = leverage
@@ -282,6 +298,7 @@ class FundingHarvester:
         self.log: list[dict] = []
         self._funding_settle_hours = {0, 8, 16}   # Bitget settles funding at 00:00/08:00/16:00 UTC
         self._last_settled_hour: dict[str, int] = {}
+        self._settlement_count: dict[str, int] = {}
 
     def _log(self, level: str, msg: str, symbol: str = None):
         entry = {"ts": datetime.now().isoformat(), "level": level, "symbol": symbol or "ALL", "msg": msg}
@@ -314,6 +331,7 @@ class FundingHarvester:
                                         self.engine.balance * 0.9)
                         if notional > 50:  # dust guard
                             record = self.engine.open_position(symbol, notional, spot_price, perp_price, self.leverage)
+                            self._settlement_count[symbol] = 0
                             self._log("TRADE", f"OPEN harvest ${notional:.0f} @ rate={rate*100:.4f}%/8h "
                                                f"(~{rate*3*365*100:.1f}% APR) | basis={basis:.3f}%", symbol)
 
@@ -322,9 +340,11 @@ class FundingHarvester:
                         # hedge itself — checked every poll, no reason to wait.
                         if self.engine.is_liquidated(symbol, perp_price):
                             record = self.engine.close_position(symbol, spot_price, perp_price, "liquidation")
+                            self._settlement_count.pop(symbol, None)
                             self._log("ERROR", f"LIQUIDATED — closed @ net_pnl={record['net_pnl']:+.2f}", symbol)
                         elif basis >= self.max_basis_pct:
                             record = self.engine.close_position(symbol, spot_price, perp_price, "basis_risk")
+                            self._settlement_count.pop(symbol, None)
                             self._log("WARN", f"Basis {basis:.3f}% >= cap, closed @ net_pnl={record['net_pnl']:+.2f}", symbol)
                         else:
                             # The exit-rate check used to run every poll (every 15 min),
@@ -338,11 +358,20 @@ class FundingHarvester:
                             if just_settled:
                                 payment = self.engine.accrue_funding(symbol, rate, perp_price)
                                 self._last_settled_hour[symbol] = now.hour
-                                self._log("INFO", f"Funding settled: {payment:+.4f} USDT (rate={rate*100:.4f}%)", symbol)
-                                if rate < self.exit_rate_threshold:
+                                settled = self._settlement_count.get(symbol, 0) + 1
+                                self._settlement_count[symbol] = settled
+                                self._log("INFO",
+                                    f"Funding settled: {payment:+.4f} USDT (rate={rate*100:.4f}%) | "
+                                    f"settlement {settled}/{self.min_hold_settlements}", symbol)
+                                # Below min_hold_settlements: skip the rate-exit check entirely,
+                                # even if the rate has already gone negative — the round-trip fee
+                                # is sunk either way, so bailing out early only locks in the
+                                # fee loss for certain instead of giving funding a chance to offset it.
+                                if settled >= self.min_hold_settlements and rate < self.exit_rate_threshold:
                                     record = self.engine.close_position(symbol, spot_price, perp_price, "rate_dropped")
-                                    self._log("TRADE", f"CLOSE rate dropped to {rate*100:.4f}%/8h @ "
-                                                       f"net_pnl={record['net_pnl']:+.2f}", symbol)
+                                    self._settlement_count.pop(symbol, None)
+                                    self._log("TRADE", f"CLOSE rate dropped to {rate*100:.4f}%/8h after "
+                                                       f"{settled} settlements @ net_pnl={record['net_pnl']:+.2f}", symbol)
                 except Exception as e:
                     self._log("ERROR", f"Cycle error: {e}", symbol)
 
@@ -379,6 +408,8 @@ class FundingHarvester:
             "interval_seconds": self.interval,
             "entry_rate_threshold": self.entry_rate_threshold,
             "exit_rate_threshold": self.exit_rate_threshold,
+            "min_hold_settlements": self.min_hold_settlements,
+            "settlement_count": self._settlement_count,
             "max_basis_pct": self.max_basis_pct,
             "leverage": self.leverage,
             "cycle_count": self.cycle_count,

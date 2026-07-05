@@ -495,8 +495,9 @@ def get_autotrader_log(limit: int = 50, symbol: str = None):
 class FundingHarvestStartRequest(BaseModel):
     symbols: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
     interval_seconds: int = 900
-    entry_rate_threshold: float = 0.00008
-    exit_rate_threshold: float = 0.00002
+    entry_rate_threshold: float = 0.00025
+    exit_rate_threshold: float = 0.0
+    min_hold_settlements: int = 13
     max_basis_pct: float = 0.5
     max_position_pct: float = 0.25
     leverage: int = 2
@@ -515,6 +516,7 @@ async def start_funding_harvest(req: FundingHarvestStartRequest):
             interval_seconds=req.interval_seconds,
             entry_rate_threshold=req.entry_rate_threshold,
             exit_rate_threshold=req.exit_rate_threshold,
+            min_hold_settlements=req.min_hold_settlements,
             max_basis_pct=req.max_basis_pct,
             max_position_pct=req.max_position_pct,
             leverage=req.leverage,
