@@ -614,6 +614,17 @@ async def stop_grid():
     return {"status": "stopped"}
 
 
+@app.post("/api/grid/close/{symbol:path}")
+async def close_grid_manual(symbol: str):
+    if symbol not in grid_engine.grids:
+        raise HTTPException(400, f"No active grid for {symbol}")
+    async with FuturesClient() as client:
+        t = await client.fetch_ticker(symbol)
+        price = t["last"]
+    record = grid_engine.close_grid(symbol, price, "manual")
+    return {"status": "closed", "record": record}
+
+
 @app.get("/api/grid/status")
 async def grid_status():
     prices = {}
