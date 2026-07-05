@@ -11,6 +11,7 @@ Paper-trading only, fully separate from the other engines.
 """
 import asyncio
 import json
+import math
 import os
 import uuid
 from datetime import datetime
@@ -258,11 +259,12 @@ class GridTrader:
         # stop-loss scale down naturally with it since both derive from the
         # same timeframe's indicators.
         timeframe: str = "15m",
-        n_levels: int = 10,
+        n_levels: int = 10,        # upper cap — actual count is shrunk to protect margin, see _levels_for_range
         atr_range_mult: float = 2.0,        # grid spans price +/- atr_range_mult*ATR
         capital_per_grid_pct: float = 0.20,  # fraction of free balance allocated per new grid
         stop_loss_pct: float = 0.03,         # close if price breaks this far below the range
         adx_ranging_max: float = 20.0,
+        min_margin_multiple: float = 3.0,   # each level's gap must be >= this many round-trip fees
     ):
         self.symbols = symbols or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
         self.engine = engine or GridEngine()
@@ -273,12 +275,25 @@ class GridTrader:
         self.capital_per_grid_pct = capital_per_grid_pct
         self.stop_loss_pct = stop_loss_pct
         self.adx_ranging_max = adx_ranging_max
+        self.min_margin_multiple = min_margin_multiple
 
         self.running = False
         self._task: Optional[asyncio.Task] = None
         self.cycle_count = 0
         self.log: list[dict] = []
         self.last_regime: dict[str, str] = {}
+
+    def _levels_for_range(self, lower: float, upper: float) -> int:
+        """Shrink n_levels so each level's gap stays comfortably above the
+        round-trip maker fee cost. A tight ATR range (e.g. on 15m) divided
+        into a fixed 10 levels can leave razor-thin per-level margin —
+        observed live as a BTC grid with only 0.03% net margin per completed
+        cycle against a 0.04% round-trip fee cost, i.e. fees eating ~57% of
+        the theoretical edge. Caps at n_levels as a ceiling, floors at 3."""
+        round_trip_fee_pct = 2 * MAKER_FEE
+        min_step = 1 + self.min_margin_multiple * round_trip_fee_pct
+        max_levels = int(math.log(upper / lower) / math.log(min_step))
+        return max(3, min(self.n_levels, max_levels))
 
     def _log(self, level: str, msg: str, symbol: str = None):
         entry = {"ts": datetime.now().isoformat(), "level": level, "symbol": symbol or "ALL", "msg": msg}
@@ -319,9 +334,10 @@ class GridTrader:
                         upper = price + atr * self.atr_range_mult
                         capital = self.engine.wallet.balance * self.capital_per_grid_pct
                         if capital > 50 and lower > 0:
-                            self.engine.open_grid(symbol, lower, upper, self.n_levels, capital)
+                            levels = self._levels_for_range(lower, upper)
+                            self.engine.open_grid(symbol, lower, upper, levels, capital)
                             self._log("TRADE", f"OPEN GRID {lower:.4f}-{upper:.4f} "
-                                              f"({self.n_levels} levels, ${capital:.0f})", symbol)
+                                              f"({levels} levels, ${capital:.0f})", symbol)
                         else:
                             self._log("INFO", f"Ranging but insufficient free balance for a new grid", symbol)
                     else:
@@ -363,6 +379,7 @@ class GridTrader:
             "n_levels": self.n_levels,
             "atr_range_mult": self.atr_range_mult,
             "stop_loss_pct": self.stop_loss_pct,
+            "min_margin_multiple": self.min_margin_multiple,
             "cycle_count": self.cycle_count,
             "last_regime": self.last_regime,
         }

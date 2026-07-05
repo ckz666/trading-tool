@@ -578,6 +578,7 @@ class GridStartRequest(BaseModel):
     capital_per_grid_pct: float = 0.20
     stop_loss_pct: float = 0.03
     adx_ranging_max: float = 20.0
+    min_margin_multiple: float = 3.0
 
 
 @app.post("/api/grid/start")
@@ -597,6 +598,7 @@ async def start_grid(req: GridStartRequest):
             capital_per_grid_pct=req.capital_per_grid_pct,
             stop_loss_pct=req.stop_loss_pct,
             adx_ranging_max=req.adx_ranging_max,
+            min_margin_multiple=req.min_margin_multiple,
         )
         grid_trader.start()
         return {"status": "started"}
