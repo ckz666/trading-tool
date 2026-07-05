@@ -31,6 +31,8 @@ class AutoTrader:
         min_ml_conf: float = 0.35,
         min_confluence: int = 8,
         min_dir_precision: float = 0.30,
+        max_stale_cycles: int = 12,
+        stale_conf_floor: float = 0.15,
     ):
         self.symbols = list(symbols or DEFAULT_SYMBOLS)
         self.timeframe = timeframe
@@ -49,6 +51,14 @@ class AutoTrader:
         self.min_ml_conf: float = min_ml_conf
         self.min_confluence: int = min_confluence
         self.min_dir_precision: float = min_dir_precision
+        # A position rides its hard SL/TP even if the model's own conviction
+        # in that direction decays to ~nothing, as long as it never flips to
+        # an outright counter-signal — observed in prod as a TAIKO/USDT long
+        # held ~40h through a slow drift to a -217 USDT stop-loss while
+        # confidence sat at 0.00 the whole time. This closes it early instead.
+        self.max_stale_cycles: int = max_stale_cycles
+        self.stale_conf_floor: float = stale_conf_floor
+        self.position_stale_cycles: dict[str, int] = {}
         self.claude_calls_saved: int = 0   # kept for API compat
         self.retrain_every: int = retrain_every_cycles
         self.monitor_interval: int = 5    # SL/TP/Liq check every 5 seconds
@@ -308,6 +318,7 @@ class AutoTrader:
             skip_reason = None
             trade_mode = "trend"
 
+            close_reason = "counter_signal"
             if has_position:
                 # Already in a position — only manage via SL/TP (handled above)
                 # Optionally close on strong counter-signal
@@ -315,11 +326,30 @@ class AutoTrader:
                 if cur_pos:
                     is_long = cur_pos.side == "long"
                     counter = (is_long and label == "sell") or (not is_long and label == "buy")
+                    supportive = (is_long and label == "buy") or (not is_long and label == "sell")
                     if counter and conf >= 0.65 and confluence_score >= MIN_CONFLUENCE:
                         action = "close_long" if is_long else "close_short"
                         skip_reason = None
-                    else:
+                    elif supportive and conf >= self.stale_conf_floor:
+                        # model still backs this direction — reset the decay counter
+                        self.position_stale_cycles[symbol] = 0
                         skip_reason = "position open — managed by SL/TP"
+                    else:
+                        # label is "hold", or points the right way but too weakly to
+                        # count as supportive — the model has lost conviction without
+                        # flipping to a hard counter-signal. Count consecutive cycles
+                        # of this and exit early rather than riding to the hard SL/TP.
+                        stale = self.position_stale_cycles.get(symbol, 0) + 1
+                        self.position_stale_cycles[symbol] = stale
+                        if stale >= self.max_stale_cycles:
+                            action = "close_long" if is_long else "close_short"
+                            close_reason = "confidence_decay"
+                            skip_reason = None
+                            self._log("INFO",
+                                f"Confidence-Decay-Exit nach {stale} Zyklen ohne Modell-Rückhalt (conf={conf:.2f})",
+                                symbol)
+                        else:
+                            skip_reason = "position open — managed by SL/TP"
             elif label == "hold":
                 skip_reason = "ML → HOLD"
             elif di_blocked:
@@ -426,6 +456,7 @@ class AutoTrader:
             cur_pos = self.engine.positions.get(symbol)
 
             if action == "open_long" and not cur_pos:
+                self.position_stale_cycles[symbol] = 0
                 record = self.engine.open_position(
                     symbol, "long", amount, price, leverage,
                     price * (1 - sl_pct), price * (1 + tp_pct),
@@ -435,6 +466,7 @@ class AutoTrader:
                     symbol, {"type": "open_long", **record})
 
             elif action == "open_short" and not cur_pos:
+                self.position_stale_cycles[symbol] = 0
                 record = self.engine.open_position(
                     symbol, "short", amount, price, leverage,
                     price * (1 + sl_pct), price * (1 - tp_pct),
@@ -444,15 +476,17 @@ class AutoTrader:
                     symbol, {"type": "open_short", **record})
 
             elif action == "close_long" and cur_pos and cur_pos.side == "long":
-                record = self._close(symbol, price, "counter_signal")
+                record = self._close(symbol, price, close_reason)
+                self.position_stale_cycles.pop(symbol, None)
                 self._log("TRADE",
-                    f"CLOSE LONG (counter-signal) @ ${price:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
+                    f"CLOSE LONG ({close_reason}) @ ${price:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
                     symbol, {"type": "close_long", **record})
 
             elif action == "close_short" and cur_pos and cur_pos.side == "short":
-                record = self._close(symbol, price, "counter_signal")
+                record = self._close(symbol, price, close_reason)
+                self.position_stale_cycles.pop(symbol, None)
                 self._log("TRADE",
-                    f"CLOSE SHORT (counter-signal) @ ${price:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
+                    f"CLOSE SHORT ({close_reason}) @ ${price:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
                     symbol, {"type": "close_short", **record})
 
             else:
@@ -640,6 +674,9 @@ class AutoTrader:
             "min_ml_conf": self.min_ml_conf,
             "min_confluence": self.min_confluence,
             "min_dir_precision": self.min_dir_precision,
+            "max_stale_cycles": self.max_stale_cycles,
+            "stale_conf_floor": self.stale_conf_floor,
+            "position_stale_cycles": self.position_stale_cycles,
             "claude_calls_saved": self.claude_calls_saved,
             "training_progress": self.training_progress,
             "model_accuracy": self.model_accuracy,

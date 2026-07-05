@@ -344,6 +344,8 @@ class AutotraderStartRequest(BaseModel):
     min_ml_conf: float = 0.35
     min_confluence: int = 8
     min_dir_precision: float = 0.30
+    max_stale_cycles: int = 12
+    stale_conf_floor: float = 0.15
 
 
 @app.post("/api/autotrader/start")
@@ -375,6 +377,8 @@ async def start_autotrader(req: AutotraderStartRequest):
             min_ml_conf=req.min_ml_conf,
             min_confluence=req.min_confluence,
             min_dir_precision=req.min_dir_precision,
+            max_stale_cycles=req.max_stale_cycles,
+            stale_conf_floor=req.stale_conf_floor,
         )
         _add_watch_symbols(req.symbols)
         train_results = await autotrader.startup()
@@ -399,6 +403,8 @@ class AutotraderConfigPatch(BaseModel):
     max_open_positions: int = None
     max_same_direction: int = None
     min_dir_precision: float = None
+    max_stale_cycles: int = None
+    stale_conf_floor: float = None
 
 @app.patch("/api/autotrader/config")
 def patch_autotrader_config(patch: AutotraderConfigPatch):
@@ -423,6 +429,12 @@ def patch_autotrader_config(patch: AutotraderConfigPatch):
     if patch.min_dir_precision is not None:
         autotrader.min_dir_precision = patch.min_dir_precision
         changed["min_dir_precision"] = patch.min_dir_precision
+    if patch.max_stale_cycles is not None:
+        autotrader.max_stale_cycles = patch.max_stale_cycles
+        changed["max_stale_cycles"] = patch.max_stale_cycles
+    if patch.stale_conf_floor is not None:
+        autotrader.stale_conf_floor = patch.stale_conf_floor
+        changed["stale_conf_floor"] = patch.stale_conf_floor
     return {"status": "updated", "changed": changed}
 
 
