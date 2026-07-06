@@ -305,6 +305,9 @@ button:disabled { opacity: 0.4; cursor: default; }
   <button class="nav-tab" onclick="showTab('funding', this)">
     <span class="tab-icon">%</span>Funding
   </button>
+  <button class="nav-tab" onclick="showTab('grid', this)">
+    <span class="tab-icon">▦</span>Grid
+  </button>
 </nav>
 
 <!-- ══════════════════════ DASHBOARD ══════════════════════ -->
@@ -675,9 +678,9 @@ button:disabled { opacity: 0.4; cursor: default; }
     <div class="card-title">Log</div>
     <div id="fh-log" class="log" style="max-height:260px;"></div>
   </div>
+</div>
 
-  <hr style="border:none;border-top:1px solid var(--border);margin:20px 0;">
-
+<div id="tab-grid" class="page">
   <!-- ── Grid Trading ─────────────────────────────────────────────────────── -->
   <div class="grid2" style="margin-bottom:12px;">
 
@@ -692,7 +695,7 @@ button:disabled { opacity: 0.4; cursor: default; }
         <div class="fg"><label>Scan-Intervall (Sek.)</label>
           <input id="gr-interval" type="number" value="300" min="60"></div>
         <div class="fg"><label>Timeframe</label>
-          <select id="gr-tf"><option value="15m">15m</option><option value="1h" selected>1h</option><option value="4h">4h</option></select></div>
+          <select id="gr-tf"><option value="15m" selected>15m</option><option value="1h">1h</option><option value="4h">4h</option></select></div>
         <div class="fg"><label>Grid-Level</label>
           <input id="gr-levels" type="number" value="10" min="3" max="30"></div>
         <div class="fg"><label>Range (x ATR)</label>
@@ -770,6 +773,8 @@ function showTab(name, btn) {
   }
   if (name === 'funding') {
     refreshFundingHarvest();
+  }
+  if (name === 'grid') {
     refreshGrid();
   }
 }
