@@ -295,6 +295,16 @@ class GridTrader:
         self.log: list[dict] = []
         self.last_regime: dict[str, str] = {}
 
+        # Fast path: fills and stop-loss react to live ticker prices (pushed in from
+        # web/app.py's price-poll loop) every few seconds, instead of waiting for the
+        # next full self.interval (300s) cycle's single candle-close price. A quick
+        # wick through several levels — or through the stop-loss — between two 5-min
+        # checks used to be invisible until the next cycle happened to catch it.
+        self.monitor_interval: int = 5
+        self._monitor_task: Optional[asyncio.Task] = None
+        self.live_prices: dict[str, float] = {}
+        self._grid_lock = asyncio.Lock()   # prevents _monitor_loop + _cycle racing on the same grid
+
     def _levels_for_range(self, lower: float, upper: float) -> int:
         """Shrink n_levels so each level's gap stays comfortably above the
         round-trip maker fee cost. A tight ATR range (e.g. on 15m) divided
@@ -349,6 +359,9 @@ class GridTrader:
         print(f"[{entry['ts'][11:19]}] [Grid] [{level}] {tag}{msg}")
 
     async def _cycle(self):
+        """Regime detection + opening new grids only — every self.interval (300s),
+        off a candle close. Fills and stop-loss on already-open grids are handled by
+        _monitor_loop() instead, at monitor_interval (5s) off live ticker prices."""
         self.cycle_count += 1
         if self.dynamic_symbols and self.cycle_count % self.symbol_refresh_cycles == 1:
             await self._refresh_symbols()
@@ -363,10 +376,44 @@ class GridTrader:
                     atr = indicators.get("atr", price * 0.015)
                     self.last_regime[symbol] = regime
 
-                    has_grid = symbol in self.engine.grids
+                    if symbol in self.engine.grids:
+                        continue
 
-                    if has_grid:
-                        grid = self.engine.grids[symbol]
+                    if regime == "ranging":
+                        lower = price - atr * self.atr_range_mult
+                        upper = price + atr * self.atr_range_mult
+                        capital = self.engine.wallet.balance * self.capital_per_grid_pct
+                        if capital > 50 and lower > 0:
+                            levels = self._levels_for_range(lower, upper)
+                            async with self._grid_lock:
+                                self.engine.open_grid(symbol, lower, upper, levels, capital)
+                            self._log("TRADE", f"OPEN GRID {lower:.4f}-{upper:.4f} "
+                                              f"({levels} levels, ${capital:.0f})", symbol)
+                        else:
+                            self._log("INFO", f"Ranging but insufficient free balance for a new grid", symbol)
+                    else:
+                        self._log("INFO", f"regime={regime} — not ranging, no grid", symbol)
+                except Exception as e:
+                    self._log("ERROR", f"Cycle error: {e}", symbol)
+
+    # ── fast monitor loop (fills + stop-loss every 5s using live prices) ────────
+    async def _monitor_loop(self):
+        while self.running:
+            await asyncio.sleep(self.monitor_interval)
+            if not self.engine.grids:
+                continue
+            prices = self.live_prices
+            if not prices:
+                continue
+            for symbol in list(self.engine.grids.keys()):
+                price = prices.get(symbol)
+                if price is None:
+                    continue
+                try:
+                    async with self._grid_lock:
+                        grid = self.engine.grids.get(symbol)
+                        if not grid:
+                            continue
                         fills = self.engine.update(symbol, price)
                         for f in fills:
                             extra = f" pnl={f['pnl']:+.4f}" if "pnl" in f else ""
@@ -376,22 +423,8 @@ class GridTrader:
                             record = self.engine.close_grid(symbol, price, "stop_loss")
                             self._log("WARN", f"Stop-loss — price broke below range, closed @ "
                                               f"realized_pnl={record['realized_pnl']:+.2f}", symbol)
-
-                    elif regime == "ranging":
-                        lower = price - atr * self.atr_range_mult
-                        upper = price + atr * self.atr_range_mult
-                        capital = self.engine.wallet.balance * self.capital_per_grid_pct
-                        if capital > 50 and lower > 0:
-                            levels = self._levels_for_range(lower, upper)
-                            self.engine.open_grid(symbol, lower, upper, levels, capital)
-                            self._log("TRADE", f"OPEN GRID {lower:.4f}-{upper:.4f} "
-                                              f"({levels} levels, ${capital:.0f})", symbol)
-                        else:
-                            self._log("INFO", f"Ranging but insufficient free balance for a new grid", symbol)
-                    else:
-                        self._log("INFO", f"regime={regime} — not ranging, no grid", symbol)
                 except Exception as e:
-                    self._log("ERROR", f"Cycle error: {e}", symbol)
+                    self._log("ERROR", f"Monitor error: {e}", symbol)
 
     async def _loop(self):
         while self.running:
@@ -406,17 +439,20 @@ class GridTrader:
             return
         self.running = True
         self._task = asyncio.create_task(self._loop())
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
         self._log("INFO", f"GridTrader started — {self.symbols} | every {self.interval}s | "
-                          f"{self.n_levels} levels | stop_loss={self.stop_loss_pct:.0%} below range")
+                          f"{self.n_levels} levels | stop_loss={self.stop_loss_pct:.0%} below range | "
+                          f"monitor every {self.monitor_interval}s")
 
     async def stop(self):
         self.running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._task, self._monitor_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         self._log("INFO", "GridTrader stopped")
 
     def status(self) -> dict:
@@ -434,4 +470,5 @@ class GridTrader:
             "max_symbols": self.max_symbols,
             "anchor_symbols": self.anchor_symbols,
             "last_symbol_refresh": self.last_symbol_refresh,
+            "monitor_interval": self.monitor_interval,
         }

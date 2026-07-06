@@ -73,9 +73,13 @@ async def _price_poll_loop():
     async with FuturesClient() as client:
         while True:
             try:
-                # include any symbols the autotrader added dynamically
+                # include any symbols the autotrader/grid_trader added dynamically
                 if autotrader:
                     for sym in autotrader.symbols:
+                        if sym not in WATCH_SYMBOLS:
+                            WATCH_SYMBOLS.append(sym)
+                if grid_trader:
+                    for sym in grid_trader.symbols:
                         if sym not in WATCH_SYMBOLS:
                             WATCH_SYMBOLS.append(sym)
 
@@ -95,9 +99,11 @@ async def _price_poll_loop():
                         "ts": datetime.now().isoformat(),
                     }
                     alert_mgr.check(sym, price)
-                    # push live price into autotrader for fast SL/TP monitoring
+                    # push live price into autotrader/grid_trader for fast SL/TP/fill monitoring
                     if autotrader:
                         autotrader.live_prices[sym] = price
+                    if grid_trader:
+                        grid_trader.live_prices[sym] = price
 
                 await _broadcast({"type": "prices", "data": list(_price_cache.values())})
                 # equity snapshot every cycle (works with or without AutoTrader)
