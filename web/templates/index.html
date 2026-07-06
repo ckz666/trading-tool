@@ -731,9 +731,9 @@ button:disabled { opacity: 0.4; cursor: default; }
       <table>
         <thead><tr>
           <th>Symbol</th><th>Range</th><th>Level (gehalten)</th><th>Trades</th>
-          <th>Realisiert</th><th>Wert</th><th>In Range</th><th>Eröffnet</th>
+          <th>Realisiert</th><th>Wert</th><th>In Range</th><th>Eröffnet</th><th></th>
         </tr></thead>
-        <tbody id="gr-grids-body"><tr class="empty-row"><td colspan="8">Keine aktiven Grids</td></tr></tbody>
+        <tbody id="gr-grids-body"><tr class="empty-row"><td colspan="9">Keine aktiven Grids</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1720,7 +1720,7 @@ function renderGrids(grids) {
   const entries = Object.entries(grids || {});
   document.getElementById('gr-count').textContent = entries.length;
   if (!entries.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Keine aktiven Grids</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="9">Keine aktiven Grids</td></tr>';
     return;
   }
   tbody.innerHTML = '';
@@ -1738,9 +1738,22 @@ function renderGrids(grids) {
       <td>${g.value!=null ? '$'+fmt(g.value) : '—'}</td>
       <td>${inRange}</td>
       <td class="muted">${fmtTime(g.opened_at)}</td>
+      <td><button class="danger" style="min-height:28px;padding:4px 10px;font-size:12px;" onclick="closeGrid('${sym}')">Schließen</button></td>
     `;
     tbody.appendChild(row);
   });
+}
+
+async function closeGrid(symbol) {
+  if (!confirm(`Grid für ${symbol.replace('/USDT','')} wirklich schließen?`)) return;
+  try {
+    const res = await fetch(`/api/grid/close/${encodeURIComponent(symbol)}`, { method: 'POST' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    await refreshGrid();
+  } catch(e) { alert('Schließen fehlgeschlagen: ' + e); }
 }
 
 async function refreshGrid() {
