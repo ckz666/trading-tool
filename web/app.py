@@ -225,6 +225,17 @@ def get_futures_trades():
     return futures_paper.trade_history
 
 
+@app.post("/api/futures/close/{symbol:path}")
+async def close_futures_position_manual(symbol: str):
+    if symbol not in futures_paper.positions:
+        raise HTTPException(400, f"No open position for {symbol}")
+    async with FuturesClient() as client:
+        t = await client.fetch_ticker(symbol)
+        price = t["last"]
+    record = futures_paper.close_position(symbol, price, "manual")
+    return {"status": "closed", "record": record}
+
+
 @app.get("/api/whale")
 async def get_whale_data(symbol: str = "BTC/USDT"):
     return await get_all_whale_data(symbol)
