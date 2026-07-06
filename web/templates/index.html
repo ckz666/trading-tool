@@ -1269,7 +1269,11 @@ async function pollAutotraderStatus() {
   });
 
   await Promise.all([refreshPositions(), refreshHistory()]);
-  if (s.running) setTimeout(safePollAutotraderStatus, 4000);
+  // Always reschedule, not just while running -- otherwise the badge freezes
+  // on "STOPPED" forever the first time it sees running=false (e.g. during a
+  // restart done outside this browser tab, such as via the API directly),
+  // even after the AutoTrader is started again moments later.
+  setTimeout(safePollAutotraderStatus, s.running ? 4000 : 8000);
 }
 
 // ── Trending Pairs ─────────────────────────────────────────────────────────
@@ -1683,7 +1687,10 @@ async function refreshFundingHarvest() {
       logEl.appendChild(line);
     });
 
-    if (s.running) setTimeout(refreshFundingHarvest, 8000);
+    // Always reschedule, not just while running -- otherwise this freezes on
+    // "stopped" forever the first time it sees running=false, even if started
+    // again later (e.g. via the API directly, outside this browser tab).
+    setTimeout(refreshFundingHarvest, s.running ? 8000 : 15000);
   } catch(e) { console.error('refreshFundingHarvest:', e); }
 }
 
@@ -1797,11 +1804,19 @@ async function refreshGrid() {
       logEl.appendChild(line);
     });
 
-    if (s.running) setTimeout(refreshGrid, 8000);
+    // Always reschedule, not just while running -- otherwise this freezes on
+    // "stopped" forever the first time it sees running=false, even if started
+    // again later (e.g. via the API directly, outside this browser tab).
+    setTimeout(refreshGrid, s.running ? 8000 : 15000);
   } catch(e) { console.error('refreshGrid:', e); }
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
+// Each poller is started unconditionally, not just when already running at
+// page load -- otherwise a page loaded while a module happens to be stopped
+// (e.g. mid-restart) would never notice it getting started later from
+// elsewhere (another tab, or the API directly), and the badge would sit
+// frozen forever without a manual page reload.
 (async () => {
   try {
     const s = await (await fetch('/api/autotrader/status')).json();
@@ -1809,8 +1824,8 @@ async function refreshGrid() {
       document.getElementById('at-start-btn').textContent = 'Lauft...';
       document.getElementById('at-start-btn').disabled = true;
       document.getElementById('at-stop-btn').disabled  = false;
-      safePollAutotraderStatus();
     }
+    safePollAutotraderStatus();
   } catch(e) { console.warn('Init check failed:', e); }
   try {
     const fs = await (await fetch('/api/funding-harvest/status')).json();
@@ -1818,8 +1833,8 @@ async function refreshGrid() {
       document.getElementById('fh-start-btn').textContent = 'Läuft...';
       document.getElementById('fh-start-btn').disabled = true;
       document.getElementById('fh-stop-btn').disabled = false;
-      refreshFundingHarvest();
     }
+    refreshFundingHarvest();
   } catch(e) { console.warn('Funding harvest init check failed:', e); }
   try {
     const gs = await (await fetch('/api/grid/status')).json();
@@ -1827,8 +1842,8 @@ async function refreshGrid() {
       document.getElementById('gr-start-btn').textContent = 'Läuft...';
       document.getElementById('gr-start-btn').disabled = true;
       document.getElementById('gr-stop-btn').disabled = false;
-      refreshGrid();
     }
+    refreshGrid();
   } catch(e) { console.warn('Grid init check failed:', e); }
 })();
 </script>
