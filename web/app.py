@@ -551,7 +551,7 @@ async def funding_harvest_status():
     prices = {}
     if funding_harvest_engine.positions:
         async with BitgetClient() as spot, FuturesClient() as perp:
-            for sym in funding_harvest_engine.positions:
+            for sym in list(funding_harvest_engine.positions):
                 try:
                     s, p = await asyncio.gather(spot.fetch_ticker(sym), perp.fetch_ticker(sym))
                     prices[sym] = {"spot": s["last"], "perp": p["last"]}
@@ -646,7 +646,7 @@ async def grid_status():
     prices = {}
     if grid_engine.grids:
         async with FuturesClient() as client:
-            for sym in grid_engine.grids:
+            for sym in list(grid_engine.grids):
                 try:
                     t = await client.fetch_ticker(sym)
                     prices[sym] = t["last"]
@@ -681,7 +681,7 @@ async def portfolio_total():
     harvest_prices = {}
     if funding_harvest_engine.positions:
         async with BitgetClient() as spot, FuturesClient() as perp:
-            for sym in funding_harvest_engine.positions:
+            for sym in list(funding_harvest_engine.positions):
                 try:
                     s, p = await asyncio.gather(spot.fetch_ticker(sym), perp.fetch_ticker(sym))
                     harvest_prices[sym] = {"spot": s["last"], "perp": p["last"]}
@@ -693,7 +693,7 @@ async def portfolio_total():
     grid_prices = {}
     if grid_engine.grids:
         async with FuturesClient() as client:
-            for sym in grid_engine.grids:
+            for sym in list(grid_engine.grids):
                 try:
                     t = await client.fetch_ticker(sym)
                     grid_prices[sym] = t["last"]
