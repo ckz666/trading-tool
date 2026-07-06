@@ -20,6 +20,7 @@ from typing import Optional
 import pandas as pd
 
 from exchange.futures_client import FuturesClient
+from exchange.market_scanner import get_trending_symbols
 from ai.ml_signal import get_indicators
 from trading.wallet import SharedWallet
 
@@ -265,9 +266,20 @@ class GridTrader:
         stop_loss_pct: float = 0.03,         # close if price breaks this far below the range
         adx_ranging_max: float = 20.0,
         min_margin_multiple: float = 3.0,   # each level's gap must be >= this many round-trip fees
+        dynamic_symbols: bool = True,
+        max_symbols: int = 8,
+        anchor_symbols: list[str] = None,    # always kept in the watchlist regardless of trend scan
+        symbol_refresh_cycles: int = 12,     # every 12 cycles = 1h at the default 300s interval
     ):
         self.symbols = symbols or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
         self.engine = engine or GridEngine()
+        self.dynamic_symbols = dynamic_symbols
+        self.max_symbols = max_symbols
+        self.anchor_symbols = anchor_symbols or ["BTC/USDT", "ETH/USDT"]
+        self.symbol_refresh_cycles = symbol_refresh_cycles
+        self._symbol_blocklist: set[str] = set()
+        self.last_symbol_refresh: str = None
+        self.trending_data: list = []
         self.interval = interval_seconds
         self.timeframe = timeframe
         self.n_levels = n_levels
@@ -295,6 +307,40 @@ class GridTrader:
         max_levels = int(math.log(upper / lower) / math.log(min_step))
         return max(3, min(self.n_levels, max_levels))
 
+    async def _refresh_symbols(self):
+        """Replace the watchlist with top trending USDT-perp pairs, keeping
+        anchors + symbols with an active grid untouched — same pattern as
+        AutoTrader's rotation, so candidates like WLD/DOGE/etc. get a chance
+        without needing to be hardcoded up front."""
+        try:
+            trending = await get_trending_symbols(top_n=self.max_symbols + 2, min_volume=20_000_000)
+            self.trending_data = trending
+            if not trending:
+                return
+
+            protected = set(self.anchor_symbols) | set(self.engine.grids.keys())
+            new_syms = list(protected)
+            for t in trending:
+                sym = t["symbol"]
+                if sym in self._symbol_blocklist:
+                    continue
+                if sym not in new_syms and len(new_syms) < self.max_symbols:
+                    new_syms.append(sym)
+
+            for a in self.anchor_symbols:
+                if a not in new_syms and len(new_syms) < self.max_symbols:
+                    new_syms.append(a)
+
+            added   = [s for s in new_syms if s not in self.symbols]
+            removed = [s for s in self.symbols if s not in new_syms]
+            self.symbols = new_syms
+            self.last_symbol_refresh = datetime.now().isoformat()
+
+            if added or removed:
+                self._log("INFO", f"Symbols aktualisiert — neu: {added} | entfernt: {removed} | aktiv: {self.symbols}")
+        except Exception as e:
+            self._log("WARN", f"Symbol-Refresh fehlgeschlagen: {e}")
+
     def _log(self, level: str, msg: str, symbol: str = None):
         entry = {"ts": datetime.now().isoformat(), "level": level, "symbol": symbol or "ALL", "msg": msg}
         self.log.append(entry)
@@ -304,6 +350,8 @@ class GridTrader:
 
     async def _cycle(self):
         self.cycle_count += 1
+        if self.dynamic_symbols and self.cycle_count % self.symbol_refresh_cycles == 1:
+            await self._refresh_symbols()
         async with FuturesClient() as client:
             for symbol in self.symbols:
                 try:
@@ -382,4 +430,8 @@ class GridTrader:
             "min_margin_multiple": self.min_margin_multiple,
             "cycle_count": self.cycle_count,
             "last_regime": self.last_regime,
+            "dynamic_symbols": self.dynamic_symbols,
+            "max_symbols": self.max_symbols,
+            "anchor_symbols": self.anchor_symbols,
+            "last_symbol_refresh": self.last_symbol_refresh,
         }
