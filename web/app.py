@@ -585,6 +585,7 @@ class GridStartRequest(BaseModel):
     stop_loss_pct: float = 0.03
     adx_ranging_max: float = 20.0
     min_margin_multiple: float = 3.0
+    min_capital_per_level: float = 15.0
     dynamic_symbols: bool = True
     max_symbols: int = 8
     anchor_symbols: list[str] = None
@@ -609,6 +610,7 @@ async def start_grid(req: GridStartRequest):
             stop_loss_pct=req.stop_loss_pct,
             adx_ranging_max=req.adx_ranging_max,
             min_margin_multiple=req.min_margin_multiple,
+            min_capital_per_level=req.min_capital_per_level,
             dynamic_symbols=req.dynamic_symbols,
             max_symbols=req.max_symbols,
             anchor_symbols=req.anchor_symbols,

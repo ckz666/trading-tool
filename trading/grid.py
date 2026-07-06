@@ -266,6 +266,7 @@ class GridTrader:
         stop_loss_pct: float = 0.03,         # close if price breaks this far below the range
         adx_ranging_max: float = 20.0,
         min_margin_multiple: float = 3.0,   # each level's gap must be >= this many round-trip fees
+        min_capital_per_level: float = 15.0,  # 3x Bitget's real $5/order futures minimum
         dynamic_symbols: bool = True,
         max_symbols: int = 8,
         anchor_symbols: list[str] = None,    # always kept in the watchlist regardless of trend scan
@@ -288,6 +289,7 @@ class GridTrader:
         self.stop_loss_pct = stop_loss_pct
         self.adx_ranging_max = adx_ranging_max
         self.min_margin_multiple = min_margin_multiple
+        self.min_capital_per_level = min_capital_per_level
 
         self.running = False
         self._task: Optional[asyncio.Task] = None
@@ -382,15 +384,25 @@ class GridTrader:
                     if regime == "ranging":
                         lower = price - atr * self.atr_range_mult
                         upper = price + atr * self.atr_range_mult
+                        if lower <= 0:
+                            self._log("INFO", "Ranging but computed range invalid (lower<=0)", symbol)
+                            continue
                         capital = self.engine.wallet.balance * self.capital_per_grid_pct
-                        if capital > 50 and lower > 0:
-                            levels = self._levels_for_range(lower, upper)
+                        levels = self._levels_for_range(lower, upper)
+                        # Bitget's real futures minimum is $5 notional/order (checked live
+                        # against BTC/ETH/XRP/SOL/DOGE) -- guarding only total grid capital
+                        # (old: >$50) let a small wallet split into levels that round-trip
+                        # below that floor and would get rejected on a real exchange. This
+                        # keeps a 3x buffer above it instead.
+                        if capital / levels >= self.min_capital_per_level:
                             async with self._grid_lock:
                                 self.engine.open_grid(symbol, lower, upper, levels, capital)
                             self._log("TRADE", f"OPEN GRID {lower:.4f}-{upper:.4f} "
                                               f"({levels} levels, ${capital:.0f})", symbol)
                         else:
-                            self._log("INFO", f"Ranging but insufficient free balance for a new grid", symbol)
+                            self._log("INFO",
+                                f"Ranging but ${capital/levels:.2f}/level < ${self.min_capital_per_level:.0f} "
+                                f"minimum — wallet too small for a new grid here", symbol)
                     else:
                         self._log("INFO", f"regime={regime} — not ranging, no grid", symbol)
                 except Exception as e:
@@ -464,6 +476,7 @@ class GridTrader:
             "atr_range_mult": self.atr_range_mult,
             "stop_loss_pct": self.stop_loss_pct,
             "min_margin_multiple": self.min_margin_multiple,
+            "min_capital_per_level": self.min_capital_per_level,
             "cycle_count": self.cycle_count,
             "last_regime": self.last_regime,
             "dynamic_symbols": self.dynamic_symbols,
