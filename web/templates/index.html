@@ -269,6 +269,7 @@ button:disabled { opacity: 0.4; cursor: default; }
   button, input, select { min-height: 44px; font-size: 15px; }
 
   .sym-cards { grid-template-columns: 1fr 1fr !important; }
+  #trending-grid { grid-template-columns: repeat(2, 1fr) !important; }
 }
 
 @media (max-width: 420px) {
@@ -291,6 +292,9 @@ button:disabled { opacity: 0.4; cursor: default; }
 <nav>
   <button class="nav-tab active" onclick="showTab('dashboard', this)">
     <span class="tab-icon">◉</span>Dashboard
+  </button>
+  <button class="nav-tab" onclick="showTab('autotrader', this)">
+    <span class="tab-icon">⚡</span>AutoTrader
   </button>
   <button class="nav-tab" onclick="showTab('market', this)">
     <span class="tab-icon">◈</span>Markt
@@ -330,6 +334,184 @@ button:disabled { opacity: 0.4; cursor: default; }
         <div class="stat"><div class="lbl">Grid Trading</div><div class="val" id="pt-grid">—</div></div>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ══════════════════════ AUTOTRADER ══════════════════════ -->
+<div id="tab-autotrader" class="page">
+  <div class="grid2" style="margin-bottom:12px;">
+
+    <!-- Portfolio -->
+    <div class="card">
+      <div class="card-title">
+        Futures Portfolio
+        <span id="at-badge" class="pill pill-gray">STOPPED</span>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="lbl">Balance</div><div class="val" id="ft-balance">—</div></div>
+        <div class="stat"><div class="lbl">Portfolio</div><div class="val" id="ft-portfolio">—</div></div>
+        <div class="stat"><div class="lbl">Ges. PnL</div><div class="val" id="ft-pnl">—</div></div>
+        <div class="stat"><div class="lbl">Heute</div><div class="val" id="ft-daily-pnl">—</div></div>
+      </div>
+      <div class="stats" style="margin-bottom:0">
+        <div class="stat"><div class="lbl">Positionen</div><div class="val" id="ft-openpos">0</div></div>
+        <div class="stat"><div class="lbl">Trades</div><div class="val" id="ft-trades">0</div></div>
+        <div class="stat"><div class="lbl">Zyklen</div><div class="val" id="ft-cycles">0</div></div>
+        <div class="stat"><div class="lbl">Retrain</div><div class="val" id="ft-retrain">—</div></div>
+      </div>
+    </div>
+
+    <!-- Equity Curve -->
+    <div class="card">
+      <div class="card-title">
+        Equity Kurve
+        <span id="eq-change" style="font-size:12px;font-weight:700;margin-left:4px;"></span>
+        <span id="eq-sharpe" style="font-size:10px;color:var(--muted);margin-left:4px;"></span>
+      </div>
+      <canvas id="equity-chart" width="600" height="120" style="width:100%;height:120px;display:block;"></canvas>
+    </div>
+
+    <!-- Risk Status -->
+    <div class="card">
+      <div class="card-title">Risk Status</div>
+      <div id="risk-panel">
+        <div class="risk-row"><span class="rk">Status</span><span style="color:var(--muted)">—</span></div>
+        <div class="risk-row"><span class="rk">Max Margin/Trade</span><span>—</span></div>
+        <div class="risk-row"><span class="rk">Daily Loss Limit</span><span>—</span></div>
+        <div class="risk-row"><span class="rk">Tages-PnL</span><span>—</span></div>
+      </div>
+      <div style="margin-top:12px;">
+        <div style="font-size:10px;color:var(--muted);font-weight:600;letter-spacing:0.5px;margin-bottom:6px;">ML PROBABILITIES</div>
+        <div class="sig-bar" id="sb">
+          <div class="sell" id="sb-sell" style="flex:1"></div>
+          <div class="hold" id="sb-hold" style="flex:1"></div>
+          <div class="buy"  id="sb-buy"  style="flex:1"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted);font-weight:600;">
+          <span id="sb-sell-pct">SELL</span><span id="sb-hold-pct">HOLD</span><span id="sb-buy-pct">BUY</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Open Positions -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">Offene Positionen <span id="pos-count" class="badge">0</span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Side</th><th>Größe</th><th>Entry</th><th>Aktuell</th>
+          <th>Lev.</th><th>Liq.</th><th>SL</th><th>TP</th><th>uPnL</th><th>ROE</th><th>Seit</th>
+        </tr></thead>
+        <tbody id="positions-body"><tr class="empty-row"><td colspan="12">Keine offenen Positionen</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Trade History -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">Trade History <span id="history-count" class="badge">0</span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Zeit</th><th>Symbol</th><th>Aktion</th><th>Entry</th><th>Exit</th>
+          <th>Lev.</th><th>Margin</th><th>PnL</th><th>ROE</th><th>Grund</th>
+        </tr></thead>
+        <tbody id="history-body"><tr class="empty-row"><td colspan="10">Keine Trades</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid2" style="margin-bottom:12px;">
+
+    <!-- Config -->
+    <div class="card">
+      <div class="card-title">Konfiguration</div>
+      <div class="cfg-grid">
+        <div class="fg"><label>Timeframe</label>
+          <select id="at-tf"><option value="15m">15m</option><option value="1h" selected>1h</option><option value="4h">4h</option></select></div>
+        <div class="fg"><label>Zyklus (Sek.)</label>
+          <input id="at-interval" type="number" value="300"></div>
+        <div class="fg"><label>Max Margin/Trade %</label>
+          <input id="at-maxpos" type="number" value="20" min="1" max="50"></div>
+        <div class="fg"><label>Max Daily Loss %</label>
+          <input id="at-maxloss" type="number" value="5" min="1" max="20"></div>
+        <div class="fg"><label>Max Leverage</label>
+          <input id="at-maxlev" type="number" value="5" min="1" max="15"></div>
+        <div class="fg"><label>Max Positionen</label>
+          <input id="at-maxpos-count" type="number" value="3" min="1" max="10"></div>
+        <div class="fg"><label>Auto-Retrain (Zyklen)</label>
+          <input id="at-retrain" type="number" value="24" min="0" max="168"></div>
+        <div class="fg"><label>Min. Konfidenz</label>
+          <input id="at-min-conf" type="number" value="0.55" min="0.40" max="0.99" step="0.05"></div>
+        <div class="fg"><label>Min. ML-Conf</label>
+          <input id="at-min-ml-conf" type="number" value="0.35" min="0.20" max="0.80" step="0.05"></div>
+        <div class="fg"><label>Min. Confluence</label>
+          <input id="at-min-confluence" type="number" value="9" min="1" max="27" step="1"></div>
+      </div>
+
+      <div id="at-live-config" style="display:none;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px;">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.05em;margin-bottom:8px;">LIVE ANPASSEN (ohne Neustart)</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+          <div class="fg" style="min-width:110px;"><label>Min. ML-Conf</label>
+            <input id="live-min-ml-conf" type="number" min="0.20" max="0.80" step="0.05" style="width:100%"></div>
+          <div class="fg" style="min-width:110px;"><label>Min. Confluence</label>
+            <input id="live-min-confluence" type="number" min="1" max="27" step="1" style="width:100%"></div>
+          <div class="fg" style="min-width:110px;"><label>Max Leverage</label>
+            <input id="live-max-lev" type="number" min="1" max="50" step="1" style="width:100%"></div>
+          <div class="fg" style="min-width:110px;"><label>Max Positionen</label>
+            <input id="live-max-pos" type="number" min="1" max="100" step="1" style="width:100%"></div>
+          <button onclick="applyLiveConfig()" style="height:40px;padding:0 16px;background:var(--blue);color:#fff;border:none;border-radius:6px;cursor:pointer;">Übernehmen</button>
+        </div>
+        <div id="live-config-msg" style="font-size:12px;margin-top:6px;color:var(--muted);"></div>
+      </div>
+
+      <div class="fg" style="margin-bottom:12px;">
+        <label>Symbols</label>
+        <div id="sym-list" style="display:flex;flex-direction:column;gap:6px;margin:8px 0;"></div>
+        <div style="display:flex;gap:8px;">
+          <input id="sym-add-input" type="text" placeholder="z.B. XRP" style="flex:1;text-transform:uppercase">
+          <button onclick="addSymbol()">+ Add</button>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:8px;">
+        <button class="primary" id="at-start-btn" onclick="startAutotrader()" style="flex:1">▶ Start + Train</button>
+        <button class="danger"  id="at-stop-btn"  onclick="stopAutotrader()" style="flex:1" disabled>■ Stop</button>
+      </div>
+      <div id="training-progress" style="display:none;margin-top:12px;">
+        <div style="font-size:10px;color:var(--muted);font-weight:600;letter-spacing:0.5px;margin-bottom:8px;">ML TRAINING</div>
+        <div id="training-bars"></div>
+      </div>
+    </div>
+
+    <!-- Signals -->
+    <div class="card">
+      <div class="card-title">Signale</div>
+      <div id="at-symbol-grid" class="sym-cards"></div>
+      <div style="font-size:10px;color:var(--muted);font-weight:600;letter-spacing:0.5px;margin-bottom:6px;">LETZTER ENTSCHEID</div>
+      <div class="reasoning" id="at-reasoning">Warte auf ersten Zyklus...</div>
+      <div style="font-size:12px;color:var(--yellow);margin-top:6px;font-weight:600;" id="at-risk-notes"></div>
+    </div>
+  </div>
+
+  <!-- Trending Pairs -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">
+      Trending Pairs
+      <span id="trending-refresh-ts" style="font-size:10px;color:var(--muted);font-weight:normal;"></span>
+      <button onclick="refreshTrending()" style="margin-left:auto;padding:5px 12px;font-size:12px;min-height:30px;">↻ Refresh</button>
+      <button onclick="applyTrendingSymbols()" class="primary" style="padding:5px 12px;font-size:12px;min-height:30px;" id="trending-apply-btn" disabled>Übernehmen</button>
+    </div>
+    <div id="trending-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;margin-top:4px;">
+      <div class="muted" style="font-size:12px;">Lade Trending-Paare...</div>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="card">
+    <div class="card-title">AutoTrader Log</div>
+    <div id="at-log" class="log" style="max-height:320px;"></div>
   </div>
 </div>
 
@@ -599,6 +781,7 @@ ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
   if (msg.type === 'prices')      updatePrices(msg.data);
   if (msg.type === 'order')       logOrder(msg.data);
+  if (msg.type === 'positions')   renderPositions(msg.data);
   if (msg.type === 'backtest_log')appendBacktestLog(msg.msg);
 };
 
@@ -610,6 +793,9 @@ function showTab(name, btn) {
   if (btn) btn.classList.add('active');
   if (name === 'dashboard') {
     refreshPortfolioTotal();
+  }
+  if (name === 'autotrader' && !document.getElementById('trending-grid').querySelector('.trend-card')) {
+    refreshTrending();
   }
   if (name === 'funding') {
     refreshFundingHarvest();
@@ -836,6 +1022,489 @@ function drawEquityBt(curve) {
   ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
   ctx.fillStyle = up ? 'rgba(22,163,74,0.08)' : 'rgba(220,38,38,0.08)'; ctx.fill();
 }
+
+// ── Symbol Manager ─────────────────────────────────────────────────────────
+let _symbols = ['BTC/USDT', 'ETH/USDT', 'HYPE/USDT'];
+
+function renderSymbolList() {
+  const list = document.getElementById('sym-list');
+  list.innerHTML = '';
+  _symbols.forEach((sym, i) => {
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex;gap:10px;align-items:center;font-size:14px;cursor:pointer;padding:4px 0;';
+    row.innerHTML = `<input type="checkbox" data-sym="${sym}" checked style="width:18px;height:18px;margin:0;"> ${sym}
+      <span onclick="removeSymbol(${i})" style="cursor:pointer;color:var(--red);margin-left:auto;font-size:18px;line-height:1;" title="Entfernen">✕</span>`;
+    list.appendChild(row);
+  });
+}
+
+function addSymbol() {
+  const inp = document.getElementById('sym-add-input');
+  let sym = inp.value.trim().toUpperCase();
+  if (!sym) return;
+  if (!sym.includes('/')) sym += '/USDT';
+  if (!_symbols.includes(sym)) { _symbols.push(sym); renderSymbolList(); }
+  inp.value = '';
+}
+
+function removeSymbol(idx) { _symbols.splice(idx, 1); renderSymbolList(); }
+
+document.getElementById('sym-add-input').addEventListener('keydown', e => { if (e.key === 'Enter') addSymbol(); });
+renderSymbolList();
+
+// ── AutoTrader ─────────────────────────────────────────────────────────────
+async function startAutotrader() {
+  const btn = document.getElementById('at-start-btn');
+  btn.textContent = 'Training...'; btn.disabled = true;
+  const symbols = [...document.querySelectorAll('#sym-list input:checked')].map(c => c.dataset.sym);
+  if (!symbols.length) { alert('Mindestens 1 Symbol wahlen'); btn.textContent = '▶ Start + Train'; btn.disabled = false; return; }
+  const body = {
+    symbols,
+    timeframe:             document.getElementById('at-tf').value,
+    interval_seconds:      parseInt(document.getElementById('at-interval').value),
+    max_position_pct:      parseFloat(document.getElementById('at-maxpos').value) / 100,
+    max_daily_loss_pct:    parseFloat(document.getElementById('at-maxloss').value) / 100,
+    max_leverage:          parseInt(document.getElementById('at-maxlev').value),
+    max_open_positions:    parseInt(document.getElementById('at-maxpos-count').value),
+    retrain_every_cycles:  parseInt(document.getElementById('at-retrain').value) || 0,
+    min_claude_confidence: parseFloat(document.getElementById('at-min-conf').value) || 0.55,
+    min_ml_conf:           parseFloat(document.getElementById('at-min-ml-conf').value) || 0.35,
+    min_confluence:        parseInt(document.getElementById('at-min-confluence').value) || 9,
+  };
+  try {
+    const r = await fetch('/api/autotrader/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok) { alert(d.detail); btn.textContent = '▶ Start + Train'; btn.disabled = false; return; }
+    document.getElementById('at-stop-btn').disabled = false;
+    btn.textContent = 'Lauft...';
+    document.getElementById('training-progress').style.display = 'block';
+    const trainingPoller = setInterval(async () => {
+      const ts = await (await fetch('/api/autotrader/status')).json();
+      const prog = ts.training_progress || {};
+      if (Object.keys(prog).length) {
+        renderTrainingBars(prog);
+        if (Object.values(prog).every(p => p >= 100)) {
+          clearInterval(trainingPoller);
+          document.getElementById('training-progress').style.display = 'none';
+          pollAutotraderStatus();
+        }
+      }
+    }, 800);
+    setTimeout(() => clearInterval(trainingPoller), 120000);
+  } catch(e) { alert(e); btn.textContent = '▶ Start + Train'; btn.disabled = false; }
+}
+
+function renderTrainingBars(prog) {
+  const barsEl = document.getElementById('training-bars');
+  barsEl.innerHTML = '';
+  Object.entries(prog).forEach(([sym, pct]) => {
+    const done = pct >= 100;
+    const color = done ? 'var(--green)' : 'var(--blue)';
+    const row = document.createElement('div');
+    row.style.cssText = 'margin-bottom:8px;';
+    row.innerHTML = `
+      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+        <span style="color:var(--muted)">${sym}</span>
+        <span style="color:${color};font-weight:600">${done ? '✓ fertig' : pct + '%'}</span>
+      </div>
+      <div class="prog-track"><div class="prog-fill" style="width:${pct}%;background:${color};"></div></div>`;
+    barsEl.appendChild(row);
+  });
+}
+
+async function stopAutotrader() {
+  await fetch('/api/autotrader/stop', { method: 'POST' });
+  document.getElementById('at-start-btn').textContent = '▶ Start + Train';
+  document.getElementById('at-start-btn').disabled = false;
+  document.getElementById('at-stop-btn').disabled = true;
+  setAtBadge('STOPPED', false);
+}
+
+async function applyLiveConfig() {
+  const patch = {};
+  const lmc  = document.getElementById('live-min-ml-conf').value;
+  const lcon = document.getElementById('live-min-confluence').value;
+  const llev = document.getElementById('live-max-lev').value;
+  const lpos = document.getElementById('live-max-pos').value;
+  if (lmc)  patch.min_ml_conf      = parseFloat(lmc);
+  if (lcon) patch.min_confluence   = parseInt(lcon);
+  if (llev) patch.max_leverage     = parseInt(llev);
+  if (lpos) patch.max_open_positions = parseInt(lpos);
+  const msg = document.getElementById('live-config-msg');
+  try {
+    const r = await fetch('/api/autotrader/config', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(patch) });
+    const d = await r.json();
+    if (r.ok) {
+      msg.textContent = 'Gespeichert: ' + Object.entries(d.changed).map(([k,v]) => `${k}=${v}`).join(', ');
+      msg.style.color = 'var(--green)';
+      ['live-min-ml-conf','live-min-confluence','live-max-lev','live-max-pos'].forEach(id => {
+        delete document.getElementById(id).dataset.dirty;
+      });
+    } else { msg.textContent = d.detail; msg.style.color = 'var(--red)'; }
+  } catch(e) { msg.textContent = 'Fehler: ' + e.message; msg.style.color = 'var(--red)'; }
+}
+
+['live-min-ml-conf','live-min-confluence','live-max-lev','live-max-pos'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('input', () => { el.dataset.dirty = '1'; });
+});
+
+function setAtBadge(text, isLive) {
+  const el = document.getElementById('at-badge');
+  el.textContent = text;
+  el.className = 'pill ' + (isLive ? 'pill-green' : 'pill-gray');
+}
+
+async function pollAutotraderStatus() {
+  const [r, logR] = await Promise.all([
+    fetch('/api/autotrader/status'),
+    fetch('/api/autotrader/log?limit=80'),
+  ]);
+  const s = await r.json();
+  const logData = await logR.json();
+
+  setAtBadge(s.running ? 'LIVE' : 'STOPPED', s.running);
+
+  const livePanel = document.getElementById('at-live-config');
+  if (s.running) {
+    livePanel.style.display = 'block';
+    const lmc = document.getElementById('live-min-ml-conf');
+    const lcon = document.getElementById('live-min-confluence');
+    const llev = document.getElementById('live-max-lev');
+    const lpos = document.getElementById('live-max-pos');
+    if (lmc && !lmc.dataset.dirty) lmc.value = s.min_ml_conf ?? 0.35;
+    if (lcon && !lcon.dataset.dirty) lcon.value = s.min_confluence ?? 9;
+    if (llev && !llev.dataset.dirty) llev.value = s.max_leverage ?? 20;
+    if (lpos && !lpos.dataset.dirty) lpos.value = s.max_open_positions ?? 30;
+  } else {
+    livePanel.style.display = 'none';
+  }
+
+  const prog = s.training_progress || {};
+  const progKeys = Object.keys(prog);
+  const trainingBox = document.getElementById('training-progress');
+  if (progKeys.length) {
+    const allDone = progKeys.every(k => prog[k] >= 100);
+    trainingBox.style.display = allDone ? 'none' : 'block';
+    if (!allDone) renderTrainingBars(prog);
+  } else { trainingBox.style.display = 'none'; }
+
+  set('ft-cycles', s.cycle_count || 0);
+
+  const retrainEl = document.getElementById('ft-retrain');
+  if (retrainEl) {
+    if (!s.retrain_every) { retrainEl.textContent = 'aus'; retrainEl.style.color = 'var(--muted)'; }
+    else {
+      const rem = (s.next_retrain_cycle || s.retrain_every) - (s.cycle_count || 0);
+      retrainEl.textContent = rem > 0 ? `in ${rem}` : 'jetzt';
+      retrainEl.style.color = rem <= 2 ? 'var(--yellow)' : 'var(--text)';
+    }
+  }
+
+  if (s.engine) {
+    const e = s.engine;
+    const pnl = e.total_pnl || 0;
+    set('ft-balance',   '$' + fmt(e.balance));
+    set('ft-portfolio', '$' + fmt(e.portfolio_value));
+    set('ft-openpos',   e.open_positions || 0);
+    set('ft-trades',    e.trade_count || 0);
+    const pnlEl = document.getElementById('ft-pnl');
+    if (pnlEl) { pnlEl.textContent = pnlStr(pnl, ' USDT'); pnlEl.style.color = pnlColor(pnl); }
+  }
+
+  if (s.risk) {
+    const risk = s.risk;
+    const dpnl = risk.daily_pnl || 0;
+    const dpEl = document.getElementById('ft-daily-pnl');
+    if (dpEl) { dpEl.textContent = pnlStr(dpnl, ' USDT'); dpEl.style.color = pnlColor(dpnl); }
+    document.getElementById('risk-panel').innerHTML = `
+      <div class="risk-row"><span class="rk">Status</span><span style="color:${risk.blocked?'var(--red)':'var(--green)'}">${risk.blocked ? '⛔ ' + risk.block_reason : '✓ OK'}</span></div>
+      <div class="risk-row"><span class="rk">Max Margin/Trade</span><span>${(risk.max_position_pct*100).toFixed(0)}%</span></div>
+      <div class="risk-row"><span class="rk">Daily Loss Limit</span><span>${(risk.max_daily_loss_pct*100).toFixed(0)}%</span></div>
+      <div class="risk-row"><span class="rk">Tages-PnL</span><span style="color:${pnlColor(dpnl)}">${pnlStr(dpnl, ' USDT')}</span></div>
+    `;
+  }
+
+  const grid = document.getElementById('at-symbol-grid');
+  const syms = s.symbols || [];
+  const cols = Math.max(1, Math.min(syms.length <= 2 ? syms.length : 3, 3));
+  grid.style.gridTemplateColumns = `repeat(${cols},1fr)`;
+  grid.innerHTML = '';
+  syms.forEach(sym => {
+    const ml  = (s.last_ml_signals || {})[sym] || {};
+    const dec = (s.last_decisions  || {})[sym] || {};
+    const mlColor  = ml.label === 'buy' ? 'var(--green)' : ml.label === 'sell' ? 'var(--red)' : 'var(--muted)';
+    const decColor = colorAction(dec.action);
+    const acc = (s.model_accuracy || {})[sym];
+    const accStr = acc != null ? ` · ${(acc*100).toFixed(0)}%` : '';
+    const di = ml.di_score != null
+      ? `<span style="font-size:10px;color:${ml.di_blocked?'var(--red)':'var(--muted)'}"> DI=${ml.di_score}</span>` : '';
+    const regimeMap = {ranging:'Seitwarts',trending:'Trend',strong_trend:'Stark',transitioning:'Uber.'};
+    const regColorMap = {ranging:'var(--yellow)',trending:'var(--green)',strong_trend:'var(--blue)',transitioning:'var(--muted)'};
+    const card = document.createElement('div');
+    card.className = 'sym-card';
+    card.innerHTML = `
+      <div class="sc-sym">${sym.replace('/USDT','')}${accStr}</div>
+      <div style="font-weight:700;font-size:13px;color:${mlColor}">${tr(TR_ML, ml.label||'—')} ${ml.confidence ? '<span style="color:var(--muted);font-weight:400;font-size:11px;">' + (ml.confidence*100).toFixed(0)+'%</span>' : ''}${di}</div>
+      <div class="sig-bar">
+        <div class="sell" style="flex:${ml.probabilities?.sell||1}"></div>
+        <div class="hold" style="flex:${ml.probabilities?.hold||1}"></div>
+        <div class="buy"  style="flex:${ml.probabilities?.buy||1}"></div>
+      </div>
+      <div style="font-weight:600;color:${decColor};font-size:12px;">${tr(TR_ACTION, dec.action||'hold')}${dec.leverage ? ' · '+dec.leverage+'x' : ''}${dec.mode==='scalp' ? ' <span class="pill pill-blue" style="padding:1px 6px;font-size:9px;">⚡ Scalp</span>' : ''}</div>
+      ${ml.regime ? '<div style="font-size:10px;margin-top:3px;color:' + (regColorMap[ml.regime]||'var(--muted)') + '">▸ '+(regimeMap[ml.regime]||ml.regime)+'</div>' : ''}
+    `;
+    grid.appendChild(card);
+  });
+
+  const lastDec = Object.values(s.last_decisions || {}).sort((a,b) => (b.ts||'')>(a.ts||'')?1:-1)[0];
+  if (lastDec) {
+    document.getElementById('at-reasoning').textContent = lastDec.skip_reason || lastDec.reasoning || tr(TR_ACTION, lastDec.action) || '—';
+    document.getElementById('at-risk-notes').textContent = lastDec.risk_notes ? '⚠ ' + lastDec.risk_notes : '';
+    const lastSym = syms.find(s2 => (s.last_decisions||{})[s2]?.ts === lastDec.ts);
+    const lastML  = lastSym ? (s.last_ml_signals||{})[lastSym] : null;
+    if (lastML?.probabilities) {
+      const p = lastML.probabilities;
+      document.getElementById('sb-sell').style.flex = p.sell;
+      document.getElementById('sb-hold').style.flex = p.hold;
+      document.getElementById('sb-buy').style.flex  = p.buy;
+      set('sb-sell-pct', 'SELL ' + (p.sell*100).toFixed(0) + '%');
+      set('sb-hold-pct', 'HOLD ' + (p.hold*100).toFixed(0) + '%');
+      set('sb-buy-pct',  'BUY '  + (p.buy *100).toFixed(0) + '%');
+    }
+  }
+
+  if (s.trending_data && s.trending_data.length && !document.getElementById('trending-grid').querySelector('.trend-card')) {
+    _trendingData = s.trending_data;
+    renderTrendingGrid(s.trending_data);
+    if (s.last_symbol_refresh) {
+      document.getElementById('trending-refresh-ts').textContent = 'Stand: ' + fmtTime(s.last_symbol_refresh);
+    }
+  }
+
+  const logEl = document.getElementById('at-log');
+  logEl.innerHTML = '';
+  logData.forEach(entry => {
+    const line = document.createElement('div');
+    line.className = 'log-line ' + (entry.level || '');
+    const sym = entry.symbol && entry.symbol !== 'ALL' ? `[${entry.symbol.replace('/USDT','')}] ` : '';
+    line.textContent = `[${fmtTime(entry.ts)}] ${sym}${entry.msg}`;
+    logEl.appendChild(line);
+  });
+
+  await Promise.all([refreshPositions(), refreshHistory()]);
+  setTimeout(safePollAutotraderStatus, s.running ? 4000 : 8000);
+}
+
+// ── Trending Pairs ─────────────────────────────────────────────────────────
+let _trendingSelected = new Set();
+let _trendingData = [];
+
+async function refreshTrending() {
+  const grid = document.getElementById('trending-grid');
+  grid.innerHTML = '<div class="muted" style="font-size:12px;">Lade...</div>';
+  try {
+    _trendingData = await (await fetch('/api/market/trending?top_n=15')).json();
+    renderTrendingGrid(_trendingData);
+    document.getElementById('trending-refresh-ts').textContent = 'Stand: ' + fmtTime(new Date().toISOString());
+  } catch(e) {
+    grid.innerHTML = '<div class="muted">Fehler beim Laden</div>';
+  }
+}
+
+function renderTrendingGrid(data) {
+  const grid = document.getElementById('trending-grid');
+  grid.innerHTML = '';
+  data.forEach(t => {
+    const isPos = t.change_pct >= 0;
+    const color = isPos ? 'var(--green)' : 'var(--red)';
+    const card = document.createElement('div');
+    card.className = 'trend-card' + (_trendingSelected.has(t.symbol) ? ' selected' : '');
+    card.dataset.symbol = t.symbol;
+    card.innerHTML =
+      '<div class="tc-sym">' + t.symbol.replace('/USDT','') + '</div>' +
+      '<div class="tc-chg" style="color:' + color + '">' + (isPos?'▲':'▼') + ' ' + (isPos?'+':'') + t.change_pct.toFixed(1) + '%</div>' +
+      '<div class="tc-vol">Vol $' + t.volume_usdt + 'M</div>';
+    card.onclick = () => {
+      if (_trendingSelected.has(t.symbol)) {
+        _trendingSelected.delete(t.symbol); card.classList.remove('selected');
+      } else {
+        _trendingSelected.add(t.symbol); card.classList.add('selected');
+      }
+      document.getElementById('trending-apply-btn').disabled = _trendingSelected.size === 0;
+    };
+    grid.appendChild(card);
+  });
+}
+
+async function applyTrendingSymbols() {
+  if (_trendingSelected.size === 0) return;
+  const btn = document.getElementById('trending-apply-btn');
+  btn.disabled = true; btn.textContent = '...';
+  try {
+    const r = await fetch('/api/autotrader/symbols/refresh', {method:'POST'});
+    btn.textContent = r.ok ? '✓ Ubernommen' : '✓ Zur Liste';
+    if (!r.ok) {
+      [..._trendingSelected].forEach(s => { if (!_symbols.includes(s)) _symbols.push(s); });
+      renderSymbolList();
+    }
+  } catch(e) { btn.textContent = 'Fehler'; }
+  setTimeout(() => { btn.textContent = 'Ubernehmen'; btn.disabled = _trendingSelected.size===0; }, 2000);
+}
+
+function safePollAutotraderStatus() {
+  pollAutotraderStatus().catch(e => {
+    console.error('poll error:', e);
+    setTimeout(safePollAutotraderStatus, 8000);
+  });
+}
+
+// ── Positions ──────────────────────────────────────────────────────────────
+function renderPositions(positions) {
+  const tbody = document.getElementById('positions-body');
+  set('pos-count', positions.length);
+  if (!positions.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="12">Keine offenen Positionen</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  positions.forEach(p => {
+    const isLong = p.side === 'long';
+    const pnl = p.unrealized_pnl || 0;
+    const roe = p.roe_pct || 0;
+    const pc  = pnlColor(pnl);
+    const row = document.createElement('tr');
+    const modeBadge = p.mode === 'scalp' ? ' <span class="pill pill-blue" title="Ranging-Markt erkannt (ADX&lt;20) — Mean-Reversion statt Trend-Signal">⚡ Scalp</span>' : '';
+    row.innerHTML = `
+      <td style="font-weight:700">${p.symbol.replace('/USDT','')}${modeBadge}</td>
+      <td><span class="pill ${isLong?'pill-green':'pill-red'}">${tr(TR_SIDE,p.side)}</span></td>
+      <td>${p.amount?.toFixed(6)}</td>
+      <td>$${fmt(p.entry_price)}</td>
+      <td>$${fmt(p.current_price||p.entry_price)}</td>
+      <td style="color:var(--blue);font-weight:600">${p.leverage}x</td>
+      <td style="color:var(--red)">$${fmt(p.liquidation_price)}</td>
+      <td style="color:var(--red)">${p.trailing_sl ? '⟳' : ''}$${fmt(p.stop_loss)}</td>
+      <td style="color:var(--green)">$${fmt(p.take_profit)}</td>
+      <td style="color:${pc};font-weight:700">${pnlStr(pnl,' USDT')}</td>
+      <td style="color:${pc};font-weight:700">${roe>=0?'+':''}${roe.toFixed(1)}%</td>
+      <td class="muted">${fmtTime(p.opened_at)}</td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+async function refreshPositions() {
+  try { renderPositions(await (await fetch('/api/autotrader/positions')).json()); }
+  catch(e) { console.error('refreshPositions:', e); }
+}
+
+// ── History ────────────────────────────────────────────────────────────────
+async function refreshHistory() {
+  try {
+    const trades = await (await fetch('/api/autotrader/history?limit=50')).json();
+    set('history-count', trades.length);
+    const tbody = document.getElementById('history-body');
+    if (!trades.length) { tbody.innerHTML = '<tr class="empty-row"><td colspan="10">Keine Trades</td></tr>'; return; }
+    tbody.innerHTML = '';
+    trades.forEach(t => {
+      const pnl = t.pnl;
+      const pc  = pnl == null ? 'var(--muted)' : pnlColor(pnl);
+      const ac  = t.action?.includes('long') ? 'var(--green)' : t.action?.includes('short') ? 'var(--red)' : 'var(--muted)';
+      const modeBadge = t.mode === 'scalp' ? ' <span class="pill pill-blue">⚡</span>' : '';
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td class="muted">${fmtTime(t.ts)}</td>
+        <td style="font-weight:700">${(t.symbol||'—').replace('/USDT','')}${modeBadge}</td>
+        <td style="color:${ac};font-weight:600">${tr(TR_ACTION, t.action)||'—'}</td>
+        <td>$${fmt(t.entry_price||t.price||0)}</td>
+        <td>${t.exit_price ? '$'+fmt(t.exit_price) : '—'}</td>
+        <td>${t.leverage ? t.leverage+'x' : '—'}</td>
+        <td>${t.margin ? '$'+fmt(t.margin) : '—'}</td>
+        <td style="color:${pc};font-weight:700">${pnl!=null ? pnlStr(pnl,' USDT') : '—'}</td>
+        <td style="color:${pc}">${t.roe_pct!=null ? (t.roe_pct>=0?'+':'')+t.roe_pct.toFixed(1)+'%' : '—'}</td>
+        <td class="muted">${tr(TR_REASON, t.reason)||'—'}</td>
+      `;
+      tbody.appendChild(row);
+    });
+  } catch(e) { console.error('refreshHistory:', e); }
+}
+
+// ── Equity Curve (AutoTrader) ────────────────────────────────────────────────
+async function refreshEquityCurve() {
+  const data = await (await fetch('/api/autotrader/equity')).json();
+  if (!data || data.length < 2) return;
+  const canvas = document.getElementById('equity-chart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth || 600;
+  const H = 120;
+  canvas.width  = W * devicePixelRatio;
+  canvas.height = H * devicePixelRatio;
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+
+  const values = data.map(d => d.equity);
+  const minV   = Math.min(...values);
+  const maxV   = Math.max(...values);
+  const range  = maxV - minV || 1;
+  const pad    = { top: 10, right: 10, bottom: 20, left: 52 };
+  const chartW = W - pad.left - pad.right;
+  const chartH = H - pad.top  - pad.bottom;
+
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.strokeStyle = 'rgba(0,0,0,0.06)'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (chartH / 4) * i;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+    const val = maxV - (range / 4) * i;
+    ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.font = '9px -apple-system,sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText('$' + val.toFixed(0), pad.left - 4, y + 3);
+  }
+
+  const first = values[0], last = values[values.length - 1];
+  const up    = last >= first;
+  const lineColor = up ? '#16a34a' : '#dc2626';
+  const grad  = ctx.createLinearGradient(0, pad.top, 0, H - pad.bottom);
+  grad.addColorStop(0, up ? 'rgba(22,163,74,0.15)' : 'rgba(220,38,38,0.15)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+
+  ctx.beginPath();
+  values.forEach((v, i) => {
+    const x = pad.left + (i / (values.length - 1)) * chartW;
+    const y = pad.top  + (1 - (v - minV) / range) * chartH;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  const lastX = pad.left + chartW, baseY = pad.top + chartH;
+  ctx.lineTo(lastX, baseY); ctx.lineTo(pad.left, baseY); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  ctx.beginPath();
+  values.forEach((v, i) => {
+    const x = pad.left + (i / (values.length - 1)) * chartW;
+    const y = pad.top  + (1 - (v - minV) / range) * chartH;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = lineColor; ctx.lineWidth = 2; ctx.stroke();
+
+  const changePct = ((last - first) / first * 100);
+  const changeEl  = document.getElementById('eq-change');
+  if (changeEl) {
+    changeEl.textContent = `${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%`;
+    changeEl.style.color = changePct >= 0 ? 'var(--green)' : 'var(--red)';
+  }
+  if (values.length > 10) {
+    const returns = values.slice(1).map((v, i) => (v - values[i]) / values[i]);
+    const mean    = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const std     = Math.sqrt(returns.map(r => (r - mean) ** 2).reduce((a, b) => a + b, 0) / returns.length);
+    const sharpe  = std > 0 ? (mean / std * Math.sqrt(365 * 288)).toFixed(2) : '—';
+    const ddEl    = document.getElementById('eq-sharpe');
+    if (ddEl) ddEl.textContent = `Sharpe ${sharpe}`;
+  }
+}
+
+refreshEquityCurve();
+setInterval(refreshEquityCurve, 30000);
 
 // ── Whale / Market Data ────────────────────────────────────────────────────
 function riskRow(label, val, color) {
@@ -1186,6 +1855,15 @@ async function refreshGrid() {
 // elsewhere (another tab, or the API directly), and the badge would sit
 // frozen forever without a manual page reload.
 (async () => {
+  try {
+    const s = await (await fetch('/api/autotrader/status')).json();
+    if (s.running) {
+      document.getElementById('at-start-btn').textContent = 'Lauft...';
+      document.getElementById('at-start-btn').disabled = true;
+      document.getElementById('at-stop-btn').disabled  = false;
+    }
+    safePollAutotraderStatus();
+  } catch(e) { console.warn('Init check failed:', e); }
   try {
     const fs = await (await fetch('/api/funding-harvest/status')).json();
     if (fs.running) {

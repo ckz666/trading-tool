@@ -10,6 +10,7 @@ from sklearn.model_selection import train_test_split
 import ta
 
 from ai.patterns import detect_patterns
+from ai.spectral_guard import rolling_cycle_strength
 
 
 MODEL_KEYS = ["gbm", "rf", "et"]
@@ -205,6 +206,13 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None) -> pd.Dat
     # combinations of the same patterns the confluence scorer already checks
     f["pattern_signal"] = _pattern_signal(df)
 
+    # Cycle strength (1 feature): detrended, differenced, Hann-windowed dominant-
+    # frequency power — see ai/spectral_guard.py. Deliberately NOT computed on raw
+    # price (that would just re-detect the random-walk spectral tilt as a fake
+    # cycle every time); values at/below NOISE_FLOOR are indistinguishable from
+    # chance and the model has to learn that, same as any other noisy feature.
+    f["cycle_strength"] = rolling_cycle_strength(df["close"])
+
     return f
 
 
@@ -285,10 +293,21 @@ def train(df: pd.DataFrame, symbol: str = "BTC/USDT",
     # ── sample weights: class balancing × temporal recency (FreqAI wfactor) ──────
     # w_i = exp(-i / (wfactor * N))[::-1] → newest sample has highest weight
     # wfactor=0.9 → newest ~2.95x more weight than oldest
-    from collections import Counter
-    cls_counts = Counter(y_train)
-    total = len(y_train)
-    class_w = np.array([total / (len(cls_counts) * cls_counts[c]) for c in y_train])
+    #
+    # Class weight is a fixed, mild ratio (not full inverse-frequency "balanced")
+    # — calibrated 2026-07-22 against BTC/USDT: full balanced weighting made the
+    # ensemble fire a directional call on ~53% of bars at ~19% precision (barely
+    # above the ~17.5% floor of guessing buy/sell blind). A dir_weight of ~2.2
+    # trades some of that fire-rate away for real precision (~26% at ~4% fire
+    # rate) — a genuine, if modest, precision/recall tradeoff, unlike raising
+    # the confidence threshold alone (confirmed flat/uninformative from 0-40%
+    # confidence — see ai/vol_regime.py-adjacent session notes). Probability
+    # calibration (isotonic and sigmoid) was tried and rejected: both collapsed
+    # to always-predicting hold, meaning honestly calibrated the base models
+    # have little real confidence left over for buy/sell once shrunk — that's
+    # the ceiling of this feature set/horizon, not a bug to calibrate away.
+    CLASS_WEIGHT = {0: 1.0, 1: 2.2, -1: 2.2}
+    class_w = np.array([CLASS_WEIGHT[c] for c in y_train])
     n = len(y_train)
     # Less temporal decay for small datasets — avoids overfitting to recent regime
     wfactor = 0.9 if n >= 400 else 0.4
@@ -316,7 +335,7 @@ def train(df: pd.DataFrame, symbol: str = "BTC/USDT",
     rf = RandomForestClassifier(
         n_estimators=n_estimators, max_depth=10,
         min_samples_leaf=3, random_state=42, n_jobs=-1,
-        class_weight="balanced",
+        class_weight=CLASS_WEIGHT,
     )
     rf.fit(X_train_s, y_train)
     _train_progress[symbol] = 80
@@ -326,7 +345,7 @@ def train(df: pd.DataFrame, symbol: str = "BTC/USDT",
     et = ExtraTreesClassifier(
         n_estimators=n_estimators, max_depth=10,
         min_samples_leaf=3, random_state=42, n_jobs=-1,
-        class_weight="balanced",
+        class_weight=CLASS_WEIGHT,
     )
     et.fit(X_train_s, y_train)
     _train_progress[symbol] = 100
@@ -656,6 +675,7 @@ def get_indicators(df: pd.DataFrame) -> dict:
         "squeeze_active":  int(sq_cur["squeeze_active"]),
         "squeeze_fired":   int(sq_cur["squeeze_fired"]),
         "squeeze_momentum":round(float(sq_cur["squeeze_momentum"]), 5),
+        "cycle_strength":  round(float(last.get("cycle_strength", 0)), 4),
         "ichimoku":        ichimoku,
     }
 

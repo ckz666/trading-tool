@@ -263,11 +263,11 @@ async def run_backtest_endpoint(req: BacktestRequest):
 class MtfBacktestRequest(BaseModel):
     symbol: str = "BTC/USDT"
     timeframe: str = "1h"
-    limit: int = 4000           # Binance: 4000 bars ≈ 166 days 1H; Bitget: max ~1200
+    limit: int = 8000           # Binance: verified available back to ~333 days 1H (2026-07-22); Bitget: max ~1200
     data_source: str = "binance"  # "binance" (more history) or "bitget"
     train_pct: float = 0.70
-    min_confluence: int = 7
-    min_conf: float = 0.50
+    min_confluence: int = 4   # calibrated 2026-07-22, see ai/backtest.py::run_backtest
+    min_conf: float = 0.40
     atr_sl_mult: float = 1.5
     atr_tp_mult: float = 3.0
     leverage: int = 5
@@ -671,6 +671,16 @@ async def grid_status():
 @app.get("/api/grid/history")
 def grid_history(limit: int = 50):
     return list(reversed(grid_engine.trade_history[-limit:]))
+
+
+@app.get("/api/strategy-correlation")
+def strategy_correlation():
+    from trading.correlation import strategy_correlation_report
+    return strategy_correlation_report(
+        futures_paper.trade_history,
+        grid_engine.trade_history,
+        funding_harvest_engine.trade_history,
+    )
 
 
 @app.get("/api/grid/log")

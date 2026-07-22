@@ -11,6 +11,9 @@ from trading.futures_paper import FuturesPaperEngine, MAINTENANCE_MARGIN
 from trading.risk import RiskManager, RiskConfig
 from ai.ml_signal import predict, get_indicators, detect_market_structure, train as ml_train, _funding_to_series
 from ai.patterns import detect_patterns
+from ai.vol_regime import classify_vol_regime
+from ai.whale import fetch_news_sentiment
+from ai.cmc import fetch_cmc_data
 
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "HYPE/USDT"]
 
@@ -29,7 +32,7 @@ class AutoTrader:
         retrain_every_cycles: int = 24,
         min_claude_confidence: float = 0.65,
         min_ml_conf: float = 0.35,
-        min_confluence: int = 8,
+        min_confluence: int = 9,   # scaled from 8/24 for the +3 News/CMC points added 2026-07-22 (max now 27)
         min_dir_precision: float = 0.30,
         max_stale_cycles: int = 12,
         stale_conf_floor: float = 0.15,
@@ -85,6 +88,11 @@ class AutoTrader:
         self.trending_data: list[dict] = []            # latest scanner results
         self.last_symbol_refresh: str = None
         self._oi_buffer: dict[str, list] = {}         # {symbol: [oi_float, ...]} rolling 300 entries
+        # News/CMC/Fear&Greed change on a macro timescale, not per 5-min cycle —
+        # cached per symbol to avoid hammering RSS feeds and burning CMC's rate-
+        # limited free-tier API credits every single cycle for every symbol.
+        self._news_cmc_cache: dict[str, tuple[float, dict]] = {}
+        self._news_cmc_ttl_seconds: int = 900   # 15 min
 
     # ── logging ───────────────────────────────────────────────────────────────
     def _log(self, level: str, msg: str, symbol: str = None, data: dict = None):
@@ -188,7 +196,23 @@ class AutoTrader:
                 except Exception:
                     return 0.0
 
-            ohlcv, ohlcv_4h, ohlcv_1d, ohlcv_15m, fr, funding_raw, market_sentiment, cvd_data, oi_now = await asyncio.gather(
+            async def _safe_news_cmc():
+                cached = self._news_cmc_cache.get(symbol)
+                now = datetime.now().timestamp()
+                if cached and (now - cached[0]) < self._news_cmc_ttl_seconds:
+                    return cached[1]
+                try:
+                    news, cmc = await asyncio.wait_for(
+                        asyncio.gather(fetch_news_sentiment(symbol), fetch_cmc_data(symbol)),
+                        timeout=12,
+                    )
+                except Exception:
+                    news, cmc = {}, {}
+                result = {"news": news, "cmc": cmc}
+                self._news_cmc_cache[symbol] = (now, result)
+                return result
+
+            ohlcv, ohlcv_4h, ohlcv_1d, ohlcv_15m, fr, funding_raw, market_sentiment, cvd_data, oi_now, news_cmc = await asyncio.gather(
                 client.fetch_ohlcv(symbol, self.timeframe, 300),
                 client.fetch_ohlcv(symbol, "4h", 100),
                 client.fetch_ohlcv(symbol, "1d", 100),
@@ -198,6 +222,7 @@ class AutoTrader:
                 _safe_sentiment(),
                 _safe_cvd(),
                 _safe_oi_current(),
+                _safe_news_cmc(),
             )
 
             # ── OI buffer: accumulate per-cycle snapshots, compute deltas ──
@@ -217,6 +242,21 @@ class AutoTrader:
             market_sentiment["oi_current"]   = buf[-1] if buf else 0.0
             market_sentiment["cvd_ratio"]    = cvd_data.get("cvd_ratio", 0.5)
             market_sentiment["cvd_net"]      = cvd_data.get("cvd_net", 0.0)
+
+            # News headlines (RSS-scraped) + CoinMarketCap (Fear&Greed, global
+            # market, coin-specific momentum) — cached up to 15min, see _safe_news_cmc.
+            news = news_cmc.get("news", {})
+            cmc  = news_cmc.get("cmc", {})
+            market_sentiment["news_bias"] = news.get("bias", "unavailable")
+            market_sentiment["news_bull"] = news.get("bull", 0)
+            market_sentiment["news_bear"] = news.get("bear", 0)
+            if cmc.get("available"):
+                fg = cmc.get("fear_greed", {})
+                market_sentiment["fear_greed_value"] = fg.get("value")
+                market_sentiment["fear_greed_bias"]  = fg.get("bias", "neutral")
+                cmc_sig = cmc.get("cmc_signal", {})
+                market_sentiment["cmc_signal_score"] = cmc_sig.get("score", 0.0)
+                market_sentiment["cmc_signal_bias"]  = cmc_sig.get("bias", "neutral")
             df     = _to_df(ohlcv)
             df_4h  = _to_df(ohlcv_4h)
             df_1d  = _to_df(ohlcv_1d)
@@ -438,9 +478,12 @@ class AutoTrader:
             }
             self.last_decisions[symbol] = decision
 
-            # ── ATR-based position sizing (Kelly-scaled risk-per-trade) ─────────
+            # ── ATR-based position sizing (Kelly-scaled risk-per-trade, ─────────
+            #    de-rated in a STORM volatility regime) ──────────────────────────
             equity      = self.engine.portfolio_value(self.live_prices | {symbol: price})
             risk_pct    = self._kelly_risk_pct(symbol)
+            vol_regime  = classify_vol_regime(df)
+            risk_pct    = risk_pct * vol_regime["risk_multiplier"]
             risk_amount = equity * risk_pct
             sl_dist     = price * sl_pct         # stop-loss distance in USDT
             sl_dist     = max(sl_dist, price * 0.005)  # minimum 0.5%
@@ -461,8 +504,9 @@ class AutoTrader:
                     symbol, "long", amount, price, leverage,
                     price * (1 - sl_pct), price * (1 + tp_pct),
                     trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode)
+                regime_tag = f" | {vol_regime['regime'].upper()}" if vol_regime["regime"] == "storm" else ""
                 self._log("TRADE",
-                    f"OPEN {mode_tag}LONG {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}) | Liq ${record['liq_price']:,.0f}",
+                    f"OPEN {mode_tag}LONG {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag} | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_long", **record})
 
             elif action == "open_short" and not cur_pos:
@@ -471,8 +515,9 @@ class AutoTrader:
                     symbol, "short", amount, price, leverage,
                     price * (1 + sl_pct), price * (1 - tp_pct),
                     trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode)
+                regime_tag = f" | {vol_regime['regime'].upper()}" if vol_regime["regime"] == "storm" else ""
                 self._log("TRADE",
-                    f"OPEN {mode_tag}SHORT {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}) | Liq ${record['liq_price']:,.0f}",
+                    f"OPEN {mode_tag}SHORT {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag} | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_short", **record})
 
             elif action == "close_long" and cur_pos and cur_pos.side == "long":
@@ -767,11 +812,11 @@ class AutoTrader:
         sentiment: dict = None,
     ) -> tuple[int, list[str]]:
         """
-        Score 0-24: signals across 1D/4H/1H/15M + on-chain + flow align with ML direction.
+        Score 0-27: signals across 1D/4H/1H/15M + on-chain + flow + macro/news align with ML direction.
         Layers: ML(2) + Ensemble(1) + 1H-RSI(1) + 1H-MACD(1) + 1H-EMA(1)
                 + VWAP(1) + 4H-structure(2) + Candle(1) + 1D-trend(2) + 15M-mom(2)
                 + Squeeze(2) + Funding-tiered(2) + L/S-ratio(1) + OI-delta(2) + CVD(2)
-                + Ichimoku(2)
+                + Ichimoku(2) + News(1) + CMC-composite(2)
         """
         label = ml_signal.get("label")
         if label == "hold":
@@ -970,6 +1015,28 @@ class AutoTrader:
                     score += 1; reasons.append("Ichimoku: unter Cloud")
                 elif pos_ == "above":
                     score -= 1; reasons.append("Ichimoku: über Cloud ⚠")
+
+        # 17. News headlines (RSS, keyword-scored) — confirming, not contrarian (0-1 pt)
+        if sentiment:
+            news_bias = sentiment.get("news_bias")
+            if news_bias == "bullish" and is_long:
+                score += 1; reasons.append(f"News bullisch ({sentiment.get('news_bull',0)}↑/{sentiment.get('news_bear',0)}↓)")
+            elif news_bias == "bearish" and not is_long:
+                score += 1; reasons.append(f"News bärisch ({sentiment.get('news_bull',0)}↑/{sentiment.get('news_bear',0)}↓)")
+
+            # 18. CoinMarketCap composite (Fear&Greed + global market + coin momentum) (0-2 pts)
+            cmc_bias = sentiment.get("cmc_signal_bias")
+            if cmc_bias:
+                bullish_tiers = {"strongly_bullish": 2, "bullish": 1, "slightly_bullish": 1}
+                bearish_tiers = {"strongly_bearish": 2, "bearish": 1, "slightly_bearish": 1}
+                fg = sentiment.get("fear_greed_value")
+                fg_str = f", F&G={fg}" if fg is not None else ""
+                if is_long and cmc_bias in bullish_tiers:
+                    pts = bullish_tiers[cmc_bias]
+                    score += pts; reasons.append(f"CMC {cmc_bias} (score={sentiment.get('cmc_signal_score',0):+.1f}{fg_str})")
+                elif not is_long and cmc_bias in bearish_tiers:
+                    pts = bearish_tiers[cmc_bias]
+                    score += pts; reasons.append(f"CMC {cmc_bias} (score={sentiment.get('cmc_signal_score',0):+.1f}{fg_str})")
 
         return max(score, 0), reasons
 

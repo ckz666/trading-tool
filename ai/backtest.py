@@ -15,7 +15,9 @@ from ai.ml_signal import (
     get_indicators, detect_market_structure, _funding_to_series,
 )
 from ai.patterns import detect_patterns
-from trading.risk import RiskManager
+from ai.vol_regime import classify_vol_regime
+from trading.risk import RiskManager, RiskConfig
+from trading.montecarlo import resample_drawdown
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -113,8 +115,8 @@ def run_backtest(
     symbol: str = "BTC/USDT",
     funding_series: pd.Series = None,
     train_pct: float = 0.70,
-    min_confluence: int = 7,
-    min_conf: float = 0.50,
+    min_confluence: int = 4,   # calibrated 2026-07-22 against actual BTC signal distribution:
+    min_conf: float = 0.40,    # old 7/0.50 sat above the 95th percentile on both axes → 0 trades, always
     atr_sl_mult: float = 1.5,     # SL = entry ± ATR * mult
     atr_tp_mult: float = 3.0,     # TP = entry ± ATR * mult  (R:R = 2)
     fee_pct: float = 0.0006,      # 0.06% taker fee per side
@@ -216,6 +218,7 @@ def run_backtest(
                     "confluence":open_trade["confluence"],
                     "ml_conf":   open_trade["ml_conf"],
                     "risk_pct":  open_trade["risk_pct"],
+                    "vol_regime":open_trade["vol_regime"],
                     "pnl_usdt":  round(net_pnl, 2),
                     "pnl_pct":   round(roe_pct, 3),
                     "cash_after":round(cash, 2),
@@ -284,6 +287,8 @@ def run_backtest(
 
         equity      = cash
         risk_pct    = _risk.kelly_risk_pct(closed_pnls) or default_risk_pct
+        vol_regime  = classify_vol_regime(window_1h)
+        risk_pct    = risk_pct * vol_regime["risk_multiplier"]
         risk_amount = equity * risk_pct
         sl_dist     = max(abs(price - sl), price * 0.005)
         raw_amount  = risk_amount / sl_dist
@@ -296,9 +301,11 @@ def run_backtest(
             "side": side, "entry": price, "sl": sl, "tp": tp,
             "entry_ts": ts, "confluence": confluence, "ml_conf": round(ml_conf, 3),
             "amount": amount, "margin": margin, "risk_pct": round(risk_pct, 4),
+            "vol_regime": vol_regime["regime"],
         }
+        regime_tag = f" | {vol_regime['regime'].upper()}" if vol_regime["regime"] == "storm" else ""
         _progress(f"{ts} OPEN {side.upper()} @ {price:.4f} | C={confluence} conf={ml_conf:.2f} | "
-                  f"Risk {risk_pct:.2%} (${risk_amount:.0f}) | SL={sl:.4f} TP={tp:.4f}")
+                  f"Risk {risk_pct:.2%} (${risk_amount:.0f}){regime_tag} | SL={sl:.4f} TP={tp:.4f}")
 
     # Close any remaining trade at last bar price
     if open_trade:
@@ -324,6 +331,7 @@ def run_backtest(
             "confluence": open_trade["confluence"],
             "ml_conf":    open_trade["ml_conf"],
             "risk_pct":   open_trade["risk_pct"],
+            "vol_regime": open_trade["vol_regime"],
             "pnl_usdt":   round(net_pnl, 2),
             "pnl_pct":    round(roe_pct, 3),
             "cash_after": round(cash, 2),
@@ -366,6 +374,14 @@ def run_backtest(
     win_rate = round(len(wins) / len(trades) * 100, 1)
     _progress(f"Backtest fertig — {len(trades)} Trades | WR {win_rate}% | Return {total_return_pct:+.2f}% | Sharpe {sharpe}")
 
+    mc = resample_drawdown(trades, RiskConfig(), n_sims=2000, start_equity=1000.0)
+    if mc:
+        _progress(
+            f"Monte-Carlo ({mc['n_sims']}x, Trade-Reihenfolge geshuffelt): "
+            f"{mc['breach_rate_pct']}% der Pfade hätten den {mc['breaker_threshold_pct']}%-Drawdown-Breaker ausgelöst "
+            f"(Median Max-DD {mc['max_drawdown_pct']['p50']}%, worst {mc['max_drawdown_pct']['worst']}%)"
+        )
+
     return {
         "symbol":          symbol,
         "train_bars":      split,
@@ -392,4 +408,5 @@ def run_backtest(
         "sharpe":          sharpe,
         "trade_log":       trades,
         "equity_curve":    equity_curve[-200:],  # last 200 points for chart
+        "monte_carlo":     mc,
     }
