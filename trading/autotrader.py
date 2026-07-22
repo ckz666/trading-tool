@@ -5,7 +5,7 @@ from datetime import datetime, date
 from typing import Optional
 
 from exchange.futures_client import FuturesClient
-from exchange.binance_data import fetch_ohlcv_binance
+from exchange.binance_data import fetch_ohlcv_binance, fetch_funding_rate_history_binance
 from exchange.market_scanner import get_trending_symbols
 from trading.futures_paper import FuturesPaperEngine, MAINTENANCE_MARGIN
 from trading.risk import RiskManager, RiskConfig
@@ -122,7 +122,17 @@ class AutoTrader:
         # live execution, position management and funding stay on Bitget (the
         # actual trading venue). Falls back to Bitget for symbols too new/small
         # to be listed on Binance yet.
-        ohlcv = await fetch_ohlcv_binance(symbol, self.timeframe, limit)
+        #
+        # Funding history: same reasoning applies and then some — Bitget caps
+        # at ~100 records (~33 days), which left funding_norm/funding_trend
+        # constant (0.0 feature importance, verified 2026-07-22) over most of
+        # any longer training window. Binance funding history goes back much
+        # further, so it's fetched from there whenever the OHLCV came from
+        # there too.
+        ohlcv, funding_raw = await asyncio.gather(
+            fetch_ohlcv_binance(symbol, self.timeframe, limit),
+            fetch_funding_rate_history_binance(symbol, 1000),
+        )
 
         # Reuse a shared client when training a batch (train_all) so ccxt's
         # load_markets() happens once, not once per symbol — firing it
@@ -139,12 +149,6 @@ class AutoTrader:
             else:
                 async with FuturesClient() as c:
                     ohlcv, funding_raw = await _fetch_bitget(c)
-        else:
-            if client is not None:
-                funding_raw = await _fetch_funding(client)
-            else:
-                async with FuturesClient() as c:
-                    funding_raw = await _fetch_funding(c)
         df = _to_df(ohlcv)
         funding_series = _funding_to_series(funding_raw)
 

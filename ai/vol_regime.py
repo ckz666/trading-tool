@@ -127,3 +127,20 @@ def classify_vol_regime(df: pd.DataFrame, vol_window: int = 24, lookback: int = 
         "prob_storm": round(prob_storm, 3),
         "risk_multiplier": REGIME_RISK_MULTIPLIER[regime],
     }
+
+
+def rolling_prob_storm(df: pd.DataFrame, vol_window: int = 24, lookback: int = 300, min_history: int = 60) -> pd.Series:
+    """
+    Per-bar prob_storm over trailing history, for use as an ML feature column
+    (2026-07-22: currently sizing-only via classify_vol_regime; this lets the
+    model itself learn regime-conditional patterns instead of just having its
+    output de-rated after the fact). Bars before min_history exist are filled
+    0.0 (calm default), same warmup convention as the rest of build_features().
+    """
+    n = len(df)
+    out = np.zeros(n)
+    close = df["close"]
+    for i in range(min_history, n):
+        window = df.iloc[max(0, i - lookback + 1): i + 1]
+        out[i] = classify_vol_regime(window, vol_window=vol_window, lookback=lookback)["prob_storm"]
+    return pd.Series(out, index=df.index)

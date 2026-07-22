@@ -7,6 +7,7 @@ import asyncio
 import aiohttp
 
 _BASE = "https://fapi.binance.com/fapi/v1/klines"
+_FUNDING_BASE = "https://fapi.binance.com/fapi/v1/fundingRate"
 _INTERVAL_MAP = {
     "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
     "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w",
@@ -64,3 +65,51 @@ async def fetch_ohlcv_binance(
             end_time = parsed[0][0] - 1   # fetch batch ending just before this one
 
     return all_candles[-limit:]
+
+
+async def fetch_funding_rate_history_binance(symbol: str, limit: int = 1000) -> list:
+    """
+    Fetch historical funding rates from Binance Futures (public, no API key).
+    Funding settles every 8h, so limit=1000 covers ~333 days — Bitget's own
+    history caps at ~100 records (~33 days), which left funding_norm/
+    funding_trend constant (0.0 feature importance) over most of any longer
+    training window. Used for training data only, same reasoning as
+    fetch_ohlcv_binance; live rate/execution stays on Bitget.
+
+    Returns ccxt-compatible records ({"timestamp": ms, "fundingRate": float}),
+    same shape ai.ml_signal._funding_to_series already expects.
+    """
+    sym = _to_binance_symbol(symbol)
+    timeout = aiohttp.ClientTimeout(total=15)
+    all_records: list = []
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        end_time = None
+        remaining = limit
+
+        while remaining > 0:
+            batch = min(remaining, 1000)
+            params: dict = {"symbol": sym, "limit": batch}
+            if end_time is not None:
+                params["endTime"] = end_time
+
+            async with session.get(_FUNDING_BASE, params=params) as r:
+                if r.status != 200:
+                    break
+                raw = await r.json()
+
+            if not raw:
+                break
+
+            parsed = [{"timestamp": int(rec["fundingTime"]), "fundingRate": float(rec["fundingRate"])}
+                      for rec in raw]
+
+            all_records = parsed + all_records
+            remaining -= len(parsed)
+
+            if len(parsed) < batch:
+                break  # no more history
+
+            end_time = parsed[0]["timestamp"] - 1
+
+    return all_records[-limit:]

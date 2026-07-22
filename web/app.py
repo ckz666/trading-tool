@@ -276,17 +276,20 @@ class MtfBacktestRequest(BaseModel):
 @app.post("/api/backtest/mtf")
 async def run_mtf_backtest_endpoint(req: MtfBacktestRequest):
     from exchange.futures_client import FuturesClient
-    from exchange.binance_data import fetch_ohlcv_binance
+    from exchange.binance_data import fetch_ohlcv_binance, fetch_funding_rate_history_binance
     from ai.ml_signal import _funding_to_series
     import pandas as pd
     import concurrent.futures
 
     if req.data_source == "binance":
-        # Binance: public, no key, years of history — only for backtest data
-        ohlcv = await fetch_ohlcv_binance(req.symbol, req.timeframe, req.limit)
-        # Funding history still from Bitget (8H records, up to 33 days)
-        async with FuturesClient() as client:
-            funding_raw = await client.fetch_funding_rate_history(req.symbol, 500)
+        # Binance: public, no key, years of OHLCV history — only for backtest data.
+        # Funding history also from Binance now (2026-07-22): Bitget caps at ~100
+        # records (~33 days), which left funding_norm/funding_trend constant
+        # (0.0 feature importance) over most of any longer training window.
+        ohlcv, funding_raw = await asyncio.gather(
+            fetch_ohlcv_binance(req.symbol, req.timeframe, req.limit),
+            fetch_funding_rate_history_binance(req.symbol, 1000),
+        )
     else:
         async with FuturesClient() as client:
             ohlcv, funding_raw = await asyncio.gather(

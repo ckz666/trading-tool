@@ -11,6 +11,7 @@ import ta
 
 from ai.patterns import detect_patterns
 from ai.spectral_guard import rolling_cycle_strength
+from ai.vol_regime import rolling_prob_storm
 
 
 MODEL_KEYS = ["gbm", "rf", "et"]
@@ -212,6 +213,12 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None) -> pd.Dat
     # cycle every time); values at/below NOISE_FLOOR are indistinguishable from
     # chance and the model has to learn that, same as any other noisy feature.
     f["cycle_strength"] = rolling_cycle_strength(df["close"])
+
+    # Vol regime (1 feature): sticky-Markov P(storm) — previously sizing-only
+    # (ai/vol_regime.py::classify_vol_regime multiplies risk_pct post-hoc), now
+    # also given to the model directly so it can learn regime-conditional
+    # patterns instead of only having its output de-rated after the fact.
+    f["prob_storm"] = rolling_prob_storm(df)
 
     return f
 
@@ -676,6 +683,7 @@ def get_indicators(df: pd.DataFrame) -> dict:
         "squeeze_fired":   int(sq_cur["squeeze_fired"]),
         "squeeze_momentum":round(float(sq_cur["squeeze_momentum"]), 5),
         "cycle_strength":  round(float(last.get("cycle_strength", 0)), 4),
+        "prob_storm":      round(float(last.get("prob_storm", 0)), 4),
         "ichimoku":        ichimoku,
     }
 
