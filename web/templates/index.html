@@ -876,9 +876,9 @@ button:disabled { opacity: 0.4; cursor: default; }
     <div style="overflow-x:auto;">
       <table>
         <thead><tr>
-          <th>Zeit</th><th>Symbol</th><th>Aktion</th><th>Entry</th><th>Exit</th><th>PnL</th><th>ROE</th><th>Grund</th>
+          <th>Zeit</th><th>Symbol</th><th>Aktion</th><th>Entry</th><th>Exit</th><th>Fee</th><th>PnL</th><th>ROE</th><th>Grund</th>
         </tr></thead>
-        <tbody id="mr-history-body"><tr class="empty-row"><td colspan="8">Keine Trades</td></tr></tbody>
+        <tbody id="mr-history-body"><tr class="empty-row"><td colspan="9">Keine Trades</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -2068,19 +2068,33 @@ function renderMeanReversionHistory(trades) {
   const tbody = document.getElementById('mr-history-body');
   document.getElementById('mr-history-count').textContent = trades.length;
   if (!trades.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Keine Trades</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="9">Keine Trades</td></tr>';
     return;
   }
   tbody.innerHTML = '';
   trades.forEach(t => {
     const pc = t.pnl != null ? pnlColor(t.pnl) : 'var(--muted)';
     const row = document.createElement('tr');
+    // "fee" only exists on open-records (entry fee, deducted from total_pnl
+    // immediately at open — see trading/futures_paper.py::open_position). The
+    // close-record's "pnl" already nets the exit fee + funding internally, so
+    // there's no separate exit-fee figure to show without changing what's
+    // persisted — this column exists specifically so the entry fee (previously
+    // invisible in this table, see project memory PnL-discrepancy report
+    // 2026-07-23) shows up as its own line instead of only being reflected
+    // silently in the engine's running total_pnl.
+    const feeTxt = t.fee != null ? '−$' + fmt(t.fee) : '—';
+    // open-records store the price under "price", not "entry_price" (that field
+    // only exists on close-records, which need both entry AND exit) — fall back
+    // so the open row's entry price actually shows instead of "—".
+    const entryPx = t.entry_price != null ? t.entry_price : t.price;
     row.innerHTML = `
       <td class="muted">${fmtTime(t.ts)}</td>
       <td style="font-weight:700">${(t.symbol||'—').replace('/USDT','')}</td>
       <td>${(t.action||'—').replace('close_','').replace('_',' ')}</td>
-      <td>${t.entry_price!=null ? '$'+fmt(t.entry_price) : '—'}</td>
+      <td>${entryPx!=null ? '$'+fmt(entryPx) : '—'}</td>
       <td>${t.exit_price!=null ? '$'+fmt(t.exit_price) : '—'}</td>
+      <td class="muted">${feeTxt}</td>
       <td style="color:${pc};font-weight:700">${t.pnl!=null ? pnlStr(t.pnl) : '—'}</td>
       <td style="color:${pc}">${t.roe_pct!=null ? (t.roe_pct>=0?'+':'')+t.roe_pct.toFixed(1)+'%' : '—'}</td>
       <td class="muted">${t.reason || '—'}</td>
