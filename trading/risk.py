@@ -3,6 +3,8 @@ from datetime import date
 import json
 import os
 
+from notifications.telegram import notify_fire_and_forget
+
 
 @dataclass
 class RiskConfig:
@@ -41,6 +43,20 @@ class RiskManager:
         self.block_reason: str = ""
         self.peak_equity: float = 0.0   # highest portfolio value ever seen
         self.state_file = state_file
+        # Separate per-check transition trackers (Telegram-notification-only,
+        # not persisted) — needed because check_daily_loss() and check_drawdown()
+        # share self.blocked/block_reason but are called back-to-back every
+        # cycle (check_daily_loss first, then check_drawdown — see autotrader.py
+        # _run_symbol). If only one of the two is actually breached, the OTHER
+        # check's "not breached" branch would otherwise clear self.blocked to
+        # False for a moment before the breached one sets it back True a line
+        # later — same-cycle, so the final state each cycle was always correct,
+        # but naively notifying on every self.blocked transition inside each
+        # function would spam an alert+recovery pair every single cycle. These
+        # two flags track each check's OWN breach state independently so a
+        # notification only fires on a genuine transition of that specific check.
+        self._dd_blocked: bool = False
+        self._daily_blocked: bool = False
         self._load_state()
 
     def _load_state(self):
@@ -82,8 +98,10 @@ class RiskManager:
         if today != self._day:
             self.daily_pnl = 0.0
             self._day = today
-            self.blocked = False
-            self.block_reason = ""
+            self._daily_blocked = False
+            if not self._dd_blocked:
+                self.blocked = False
+                self.block_reason = ""
             if portfolio_value is not None:
                 self.day_start_equity = portfolio_value
 
@@ -110,10 +128,20 @@ class RiskManager:
                     f"Drawdown-Breaker: {drawdown:.1%} unter Peak "
                     f"(Peak ${self.peak_equity:,.0f} → aktuell ${portfolio_value:,.0f})"
                 )
+                if not self._dd_blocked:
+                    notify_fire_and_forget(f"🚨 <b>Risk-Block ausgelöst</b>\n{self.block_reason}")
+                self._dd_blocked = True
                 self._save_state()
                 return False
-        self.blocked = False
-        self.block_reason = ""
+        if self._dd_blocked:
+            notify_fire_and_forget(f"✅ <b>Drawdown-Block aufgehoben</b>\nWieder unter {self.config.max_drawdown_pct:.0%} Drawdown")
+        self._dd_blocked = False
+        # Only clear the combined display flag if the OTHER check isn't also
+        # currently blocking — otherwise this would stomp on a daily-loss block
+        # that's still active (see class docstring on _dd_blocked/_daily_blocked).
+        if not self._daily_blocked:
+            self.blocked = False
+            self.block_reason = ""
         self._save_state()
         return True
 
@@ -139,10 +167,17 @@ class RiskManager:
                     f"Daily loss limit reached: {loss_pct*100:.1f}% "
                     f"(Tagesstart ${self.day_start_equity:,.0f} → aktuell ${portfolio_value:,.0f})"
                 )
+                if not self._daily_blocked:
+                    notify_fire_and_forget(f"🚨 <b>Risk-Block ausgelöst</b>\n{self.block_reason}")
+                self._daily_blocked = True
                 self._save_state()
                 return False
-        self.blocked = False
-        self.block_reason = ""
+        if self._daily_blocked:
+            notify_fire_and_forget(f"✅ <b>Daily-Loss-Block aufgehoben</b>\nWieder unter {self.config.max_daily_loss_pct:.0%} Tagesverlust")
+        self._daily_blocked = False
+        if not self._dd_blocked:
+            self.blocked = False
+            self.block_reason = ""
         self._save_state()
         return True
 

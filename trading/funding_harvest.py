@@ -17,6 +17,8 @@ from typing import Optional
 from exchange.client import BitgetClient
 from exchange.futures_client import FuturesClient
 from trading.wallet import SharedWallet
+from notifications.telegram import notify_fire_and_forget
+from trading.journal import get_journal
 
 SPOT_FEE = 0.001        # 0.1% taker, matches trading/paper.py
 PERP_TAKER_FEE = 0.0006  # matches trading/futures_paper.py
@@ -80,6 +82,7 @@ class FundingHarvestEngine:
         self.trade_history: list[dict] = []
         self.total_funding_earned = 0.0
         self.total_fees_paid = 0.0
+        self.equity_history: list[dict] = []   # [{ts, equity}], see trading/metrics.py
         self._load()
 
     def _save(self):
@@ -88,6 +91,7 @@ class FundingHarvestEngine:
             "total_funding_earned": self.total_funding_earned,
             "total_fees_paid": self.total_fees_paid,
             "trade_history": self.trade_history,
+            "equity_history": self.equity_history[-2000:],
             "positions": {sym: pos.to_dict() for sym, pos in self.positions.items()},
             "saved_at": datetime.now().isoformat(),
         }
@@ -96,6 +100,13 @@ class FundingHarvestEngine:
             json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
         self.wallet._save()
+
+    def record_equity(self, prices: dict[str, dict]):
+        """Mirrors FuturesPaperEngine.record_equity — see trading/metrics.py."""
+        equity = self.portfolio_value(prices)
+        self.equity_history.append({"ts": datetime.now().isoformat(), "equity": round(equity, 2)})
+        if len(self.equity_history) > 2000:
+            self.equity_history = self.equity_history[:1] + self.equity_history[1:-500:2] + self.equity_history[-500:]
 
     def _load(self):
         if not os.path.exists(STATE_FILE):
@@ -106,6 +117,7 @@ class FundingHarvestEngine:
             self.total_funding_earned = state.get("total_funding_earned", 0.0)
             self.total_fees_paid = state.get("total_fees_paid", 0.0)
             self.trade_history = state.get("trade_history", [])
+            self.equity_history = state.get("equity_history", [])
             for sym, d in state.get("positions", {}).items():
                 self.positions[sym] = HarvestPosition(
                     symbol=d["symbol"], spot_qty=d["spot_qty"], perp_qty=d["perp_qty"],
@@ -306,9 +318,12 @@ class FundingHarvester:
         self.log = self.log[-300:]
         tag = f"[{symbol}] " if symbol else ""
         print(f"[{entry['ts'][11:19]}] [FundingHarvest] [{level}] {tag}{msg}")
+        if level == "TRADE":
+            notify_fire_and_forget(f"💰 <b>Funding Harvest</b> {tag}\n{msg}")
 
     async def _cycle(self):
         self.cycle_count += 1
+        prices_this_cycle: dict[str, dict] = {}
         async with BitgetClient() as spot, FuturesClient() as perp:
             for symbol in self.symbols:
                 try:
@@ -328,6 +343,7 @@ class FundingHarvester:
                         self._log("WARN", "Funding-Rate-Fetch fehlgeschlagen — Zyklus übersprungen", symbol)
                         continue
                     spot_price, perp_price = spot_t["last"], perp_t["last"]
+                    prices_this_cycle[symbol] = {"spot": spot_price, "perp": perp_price}
                     rate = fr["rate"]
                     self.last_rates[symbol] = rate
                     basis = abs(perp_price - spot_price) / spot_price * 100
@@ -344,6 +360,9 @@ class FundingHarvester:
                             self._settlement_count[symbol] = 0
                             self._log("TRADE", f"OPEN harvest ${notional:.0f} @ rate={rate*100:.4f}%/8h "
                                                f"(~{rate*3*365*100:.1f}% APR) | basis={basis:.3f}%", symbol)
+                            get_journal().record("funding_harvest", symbol, "open",
+                                f"Funding-Rate {rate*100:.4f}%/8h (~{rate*3*365*100:.1f}% APR) ≥ Schwelle "
+                                f"{self.entry_rate_threshold*100:.4f}%, Basis {basis:.3f}%")
 
                     elif has_position:
                         # Liquidation and basis-blowout are genuine ongoing risks to the
@@ -352,10 +371,14 @@ class FundingHarvester:
                             record = self.engine.close_position(symbol, spot_price, perp_price, "liquidation")
                             self._settlement_count.pop(symbol, None)
                             self._log("ERROR", f"LIQUIDATED — closed @ net_pnl={record['net_pnl']:+.2f}", symbol)
+                            get_journal().record("funding_harvest", symbol, "close", "Liquidation", pnl=record["net_pnl"])
                         elif basis >= self.max_basis_pct:
                             record = self.engine.close_position(symbol, spot_price, perp_price, "basis_risk")
                             self._settlement_count.pop(symbol, None)
                             self._log("WARN", f"Basis {basis:.3f}% >= cap, closed @ net_pnl={record['net_pnl']:+.2f}", symbol)
+                            get_journal().record("funding_harvest", symbol, "close",
+                                f"Basis {basis:.3f}% ≥ Cap {self.max_basis_pct:.2f}% — Hedge droht auseinanderzulaufen",
+                                pnl=record["net_pnl"])
                         else:
                             # The exit-rate check used to run every poll (every 15 min),
                             # closing positions on short-lived rate noise before a single
@@ -382,8 +405,13 @@ class FundingHarvester:
                                     self._settlement_count.pop(symbol, None)
                                     self._log("TRADE", f"CLOSE rate dropped to {rate*100:.4f}%/8h after "
                                                        f"{settled} settlements @ net_pnl={record['net_pnl']:+.2f}", symbol)
+                                    get_journal().record("funding_harvest", symbol, "close",
+                                        f"Rate auf {rate*100:.4f}%/8h gefallen (< Exit-Schwelle) nach "
+                                        f"{settled} Settlements", pnl=record["net_pnl"])
                 except Exception as e:
                     self._log("ERROR", f"Cycle error: {e}", symbol)
+            if prices_this_cycle:
+                self.engine.record_equity(prices_this_cycle)
 
     async def _loop(self):
         while self.running:

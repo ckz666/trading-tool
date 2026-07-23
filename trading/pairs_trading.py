@@ -26,6 +26,8 @@ import pandas as pd
 
 from exchange.futures_client import FuturesClient
 from trading.futures_paper import FuturesPaperEngine
+from notifications.telegram import notify_fire_and_forget
+from trading.journal import get_journal
 
 PAIRS_STATE_FILE = "data/pairs_trading_state.json"
 
@@ -84,6 +86,8 @@ class PairsTradingHarvester:
         self.log = self.log[-300:]
         tag = f"[{symbol}] " if symbol else ""
         print(f"[{entry['ts'][11:19]}] [PairsTrading] [{level}] {tag}{msg}")
+        if level == "TRADE":
+            notify_fire_and_forget(f"⚖️ <b>Pairs Trading</b> {tag}\n{msg}")
 
     def _compute_zscore(self, df_a: pd.DataFrame, df_b: pd.DataFrame) -> tuple[Optional[float], Optional[float]]:
         n = min(len(df_a), len(df_b))
@@ -105,6 +109,8 @@ class PairsTradingHarvester:
         pnl_b = rec_b["pnl"] if rec_b else 0.0
         self._log("TRADE", f"CLOSE PAIR ({reason}) z={self.last_z:.2f} | "
                             f"{self.symbol_a}={pnl_a:+.2f} {self.symbol_b}={pnl_b:+.2f} | total={pnl_a+pnl_b:+.2f}")
+        get_journal().record("pairs_trading", f"{self.symbol_a}/{self.symbol_b}", "close_pair",
+                              f"{reason}, z={self.last_z:.2f}", pnl=pnl_a + pnl_b)
         self.open_pair = None
 
     async def _cycle(self):
@@ -221,6 +227,9 @@ class PairsTradingHarvester:
                 self.open_pair = {"direction": direction, "opened_bar": self._bar_count, "entry_z": z}
                 self._log("TRADE", f"OPEN PAIR {direction} | z={z:.2f} std={std:.5f} | "
                                     f"{self.symbol_a}={side_a}@{price_a:.2f} {self.symbol_b}={side_b}@{price_b:.2f}")
+                get_journal().record("pairs_trading", f"{self.symbol_a}/{self.symbol_b}", "open_pair",
+                                      f"log-Spread z-Score {z:.2f} ≥ Entry-Schwelle {self.z_entry} — "
+                                      f"{direction.replace('_', ' ')}")
 
             except Exception as e:
                 self._log("ERROR", f"Cycle error: {e}")

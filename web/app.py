@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -26,6 +27,9 @@ from strategies.base import STRATEGIES
 from monitoring.alerts import AlertManager
 from ai.whale import get_all_whale_data
 from exchange.market_scanner import get_trending_symbols, get_all_market_overview
+from exchange.liquidation_stream import get_collector as get_liquidation_collector
+from trading.journal import get_journal
+from trading.metrics import compute_metrics
 
 
 # ── shared state ─────────────────────────────────────────────────────────────
@@ -52,13 +56,18 @@ pairs_trading_harvester: PairsTradingHarvester = None
 _pairs_trading_starting = False
 _price_cache: dict[str, dict] = {}
 _ws_clients: list[WebSocket] = []
+_combined_equity_history: list[dict] = []   # [{ts, equity}] — true cross-engine total, see compute_total_portfolio_value_cached
+COMBINED_EQUITY_FILE = "data/combined_equity_history.json"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_combined_equity_history()
     task = asyncio.create_task(_price_poll_loop())
+    get_liquidation_collector().start()
     yield
     task.cancel()
+    await get_liquidation_collector().stop()
 
 
 app = FastAPI(title="Bitget Trading Tool", lifespan=lifespan)
@@ -70,6 +79,35 @@ def _add_watch_symbols(symbols: list[str]):
     for s in symbols:
         if s not in WATCH_SYMBOLS:
             WATCH_SYMBOLS.append(s)
+
+
+def _load_combined_equity_history():
+    global _combined_equity_history
+    if not os.path.exists(COMBINED_EQUITY_FILE):
+        return
+    try:
+        with open(COMBINED_EQUITY_FILE) as f:
+            _combined_equity_history = json.load(f)
+    except Exception as e:
+        print(f"[CombinedEquity] Could not load state: {e} — starting fresh")
+
+
+def _record_combined_equity():
+    """True cross-engine equity curve (compute_total_portfolio_value_cached),
+    recorded once per price-poll cycle — separate from each engine's own
+    equity_history (trading/futures_paper.py), which only sees that engine's
+    own positions. Feeds the combined Sharpe/MaxDD in /api/portfolio/metrics —
+    see project memory, cross-engine risk-blindness fix 2026-07-23, the same
+    reasoning that motivated portfolio_value_fn on AutoTrader applies here."""
+    equity = compute_total_portfolio_value_cached()
+    _combined_equity_history.append({"ts": datetime.now().isoformat(), "equity": round(equity, 2)})
+    if len(_combined_equity_history) > 2000:
+        del _combined_equity_history[1:-500:2]
+    os.makedirs(os.path.dirname(COMBINED_EQUITY_FILE), exist_ok=True)
+    tmp = COMBINED_EQUITY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(_combined_equity_history[-2000:], f)
+    os.replace(tmp, COMBINED_EQUITY_FILE)
 
 
 async def _price_poll_loop():
@@ -130,6 +168,7 @@ async def _price_poll_loop():
                 prices = {sym: d["price"] for sym, d in _price_cache.items()}
                 engine = autotrader.engine if autotrader else futures_paper
                 engine.record_equity(prices)
+                _record_combined_equity()
 
                 # broadcast live position updates so frontend stays current
                 if autotrader and autotrader.engine.positions:
@@ -980,6 +1019,46 @@ async def portfolio_total():
         "valuation_status": "incomplete" if missing_symbols else "complete",
         "missing_symbols": sorted(missing_symbols),
     }
+
+
+@app.get("/api/journal")
+def get_journal_endpoint(limit: int = 100, engine: str = None, symbol: str = None):
+    """Shared trade journal across all four engines — each entry has a
+    human-readable reason (confluence criteria, RSI/ADX levels, z-score,
+    funding rate, ...), see trading/journal.py."""
+    return get_journal().recent(limit=limit, engine=engine, symbol=symbol)
+
+
+@app.get("/api/portfolio/metrics")
+def portfolio_metrics():
+    """Sharpe ratio / max drawdown per engine plus the true combined portfolio
+    (from _combined_equity_history, recorded every price-poll cycle — see
+    _record_combined_equity). Per-engine equity_history only sees that
+    engine's own positions, same scoping caveat as their own portfolio_value()."""
+    return {
+        "combined": compute_metrics(_combined_equity_history),
+        "autotrader": compute_metrics(futures_paper.equity_history),
+        "funding_harvest": compute_metrics(funding_harvest_engine.equity_history),
+        "grid": compute_metrics(grid_engine.equity_history if hasattr(grid_engine, "equity_history") else []),
+        "mean_reversion": compute_metrics(mean_reversion_engine.equity_history),
+        "pairs_trading": compute_metrics(pairs_trading_engine.equity_history),
+    }
+
+
+@app.get("/api/liquidation-flow/{symbol:path}")
+def liquidation_flow(symbol: str, window_hours: float = 1.0):
+    """Free real-time liquidation flow (Binance forceOrder stream, no API key)
+    — see exchange/liquidation_stream.py for why this isn't a Coinglass-style
+    price-level heatmap (that needs a paid $699+/mo plan)."""
+    return get_liquidation_collector().flow_score(symbol, window_hours=window_hours)
+
+
+@app.get("/api/reddit-sentiment/{symbol:path}")
+async def reddit_sentiment_endpoint(symbol: str):
+    """{'available': False} until REDDIT_CLIENT_ID/SECRET are set in .env —
+    see ai/reddit_sentiment.py."""
+    from ai.reddit_sentiment import fetch_reddit_sentiment
+    return await fetch_reddit_sentiment(symbol)
 
 
 @app.get("/api/market/trending")

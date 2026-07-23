@@ -27,6 +27,8 @@ import pandas as pd
 from exchange.futures_client import FuturesClient
 from trading.futures_paper import FuturesPaperEngine
 from ai.ml_signal import get_indicators
+from notifications.telegram import notify_fire_and_forget
+from trading.journal import get_journal
 
 MR_STATE_FILE = "data/mean_reversion_state.json"
 
@@ -85,6 +87,8 @@ class MeanReversionHarvester:
         self.log = self.log[-300:]
         tag = f"[{symbol}] " if symbol else ""
         print(f"[{entry['ts'][11:19]}] [MeanReversion] [{level}] {tag}{msg}")
+        if level == "TRADE":
+            notify_fire_and_forget(f"↔️ <b>Mean Reversion</b> {tag}\n{msg}")
 
     def _signal(self, indicators: dict) -> tuple[str, str]:
         adx = indicators.get("adx", 100)
@@ -119,6 +123,7 @@ class MeanReversionHarvester:
                         record = self.engine.close_position(symbol, price, trigger)
                         self._log("TRADE", f"{trigger.upper()} closed @ {price:.4f} | "
                                             f"net_pnl={record['pnl']:+.2f}", symbol)
+                        get_journal().record("mean_reversion", symbol, "close", trigger, pnl=record["pnl"])
                         continue
 
                     if symbol in self.engine.positions:
@@ -154,6 +159,7 @@ class MeanReversionHarvester:
                     )
                     self._log("TRADE", f"OPEN {side.upper()} @ {price:.4f} | {reason} | "
                                         f"SL={sl:.4f} TP={tp:.4f}", symbol)
+                    get_journal().record("mean_reversion", symbol, f"open_{side}", reason)
                 except Exception as e:
                     self._log("ERROR", f"Cycle error: {e}", symbol)
 

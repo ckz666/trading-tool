@@ -17,6 +17,10 @@ from ai.patterns import detect_patterns
 from ai.vol_regime import classify_vol_regime
 from ai.whale import fetch_news_sentiment
 from ai.cmc import fetch_cmc_data
+from ai.reddit_sentiment import fetch_reddit_sentiment
+from exchange.liquidation_stream import get_collector as get_liquidation_collector
+from notifications.telegram import notify_fire_and_forget
+from trading.journal import get_journal
 
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "HYPE/USDT"]
 
@@ -148,6 +152,10 @@ class AutoTrader:
         # limited free-tier API credits every single cycle for every symbol.
         self._news_cmc_cache: dict[str, tuple[float, dict]] = {}
         self._news_cmc_ttl_seconds: int = 900   # 15 min
+        # Reddit sentiment — same reasoning/TTL as news/CMC above, plus it's an
+        # OAuth-token-limited API not meant to be hit every 5min per symbol.
+        self._reddit_cache: dict[str, tuple[float, dict]] = {}
+        self._reddit_ttl_seconds: int = 900     # 15 min
 
     # ── logging ───────────────────────────────────────────────────────────────
     def _log(self, level: str, msg: str, symbol: str = None, data: dict = None):
@@ -162,6 +170,8 @@ class AutoTrader:
         self.log = self.log[-500:]
         tag = f"[{symbol}] " if symbol else ""
         print(f"[{entry['ts'][11:19]}] [{level}] {tag}{msg}")
+        if level == "TRADE":
+            notify_fire_and_forget(f"🤖 <b>AutoTrader</b> {tag}\n{msg}")
 
     # ── model training ────────────────────────────────────────────────────────
     async def train_model(self, symbol: str, limit: int = 2000, client: FuturesClient = None) -> dict:
@@ -289,7 +299,19 @@ class AutoTrader:
                 self._news_cmc_cache[symbol] = (now, result)
                 return result
 
-            ohlcv, ohlcv_4h, ohlcv_1d, ohlcv_15m, fr, funding_raw, market_sentiment, cvd_data, oi_now, news_cmc = await asyncio.gather(
+            async def _safe_reddit():
+                cached = self._reddit_cache.get(symbol)
+                now = datetime.now().timestamp()
+                if cached and (now - cached[0]) < self._reddit_ttl_seconds:
+                    return cached[1]
+                try:
+                    result = await asyncio.wait_for(fetch_reddit_sentiment(symbol), timeout=12)
+                except Exception:
+                    result = {"available": False}
+                self._reddit_cache[symbol] = (now, result)
+                return result
+
+            ohlcv, ohlcv_4h, ohlcv_1d, ohlcv_15m, fr, funding_raw, market_sentiment, cvd_data, oi_now, news_cmc, reddit = await asyncio.gather(
                 client.fetch_ohlcv(symbol, self.timeframe, 300),
                 client.fetch_ohlcv(symbol, "4h", 100),
                 client.fetch_ohlcv(symbol, "1d", 100),
@@ -300,7 +322,12 @@ class AutoTrader:
                 _safe_cvd(),
                 _safe_oi_current(),
                 _safe_news_cmc(),
+                _safe_reddit(),
             )
+            # Liquidation flow: read-only from the always-running background
+            # WebSocket collector (exchange/liquidation_stream.py) — no network
+            # call here, so no caching needed, unlike the fetch-based sources above.
+            liq_flow = get_liquidation_collector().flow_score(symbol, window_hours=1.0)
 
             # ── OI buffer: accumulate per-cycle snapshots, compute deltas ──
             buf = self._oi_buffer.setdefault(symbol, [])
@@ -349,6 +376,15 @@ class AutoTrader:
                 cmc_sig = cmc.get("cmc_signal", {})
                 market_sentiment["cmc_signal_score"] = cmc_sig.get("score", 0.0)
                 market_sentiment["cmc_signal_bias"]  = cmc_sig.get("bias", "neutral")
+            if reddit.get("available"):
+                market_sentiment["reddit_bias"] = reddit.get("bias", "neutral")
+                market_sentiment["reddit_bull"] = reddit.get("bull_mentions", 0)
+                market_sentiment["reddit_bear"] = reddit.get("bear_mentions", 0)
+            if liq_flow.get("available"):
+                market_sentiment["liq_dominant_side"] = liq_flow.get("dominant_side")
+                market_sentiment["liq_dominance_ratio"] = liq_flow.get("dominance_ratio", 1.0)
+                market_sentiment["liq_long_usd"] = liq_flow.get("long_liq_usd", 0)
+                market_sentiment["liq_short_usd"] = liq_flow.get("short_liq_usd", 0)
             df     = _to_df(ohlcv)
             df_4h  = _to_df(ohlcv_4h)
             df_1d  = _to_df(ohlcv_1d)
@@ -475,7 +511,7 @@ class AutoTrader:
 
             self._log("INFO",
                 f"ML → {label.upper()} conf={conf:.2f} | DI={di_score:.2f} | "
-                f"C_long={score_long} C_short={score_short}/26",
+                f"C_long={score_long} C_short={score_short}/28",
                 symbol)
 
             action = "hold"
@@ -530,7 +566,7 @@ class AutoTrader:
                 label_direction = "long" if label == "buy" else ("short" if label == "sell" else None)
 
                 if best < eff_min:
-                    skip_reason = f"C={best}/26 < {eff_min}" + (" (ML=hold — höhere Hürde)" if ml_was_hold else "")
+                    skip_reason = f"C={best}/28 < {eff_min}" + (" (ML=hold — höhere Hürde)" if ml_was_hold else "")
                 elif abs(score_long - score_short) < self.neutral_zone:
                     skip_reason = f"Neutralzone |{score_long}-{score_short}| < {self.neutral_zone}"
                 elif self.skip_contra and label_direction and entry_direction != label_direction:
@@ -603,11 +639,11 @@ class AutoTrader:
             reasons_str = " | ".join(confluence_reasons[:4])
             mode_tag = "SCALP " if trade_mode == "scalp" else ""
             self._log("INFO",
-                f"SIGNAL {mode_tag}{action.upper()} | C={confluence_score}/26 | conf={conf:.2f} | SL={sl_pct:.1%} TP={tp_pct:.1%} | {reasons_str}",
+                f"SIGNAL {mode_tag}{action.upper()} | C={confluence_score}/28 | conf={conf:.2f} | SL={sl_pct:.1%} TP={tp_pct:.1%} | {reasons_str}",
                 symbol)
 
             reasoning = (reasons_str if trade_mode == "scalp" else
-                         f"Rule: C={confluence_score}/26 ≥ {MIN_CONFLUENCE}. {reasons_str}")
+                         f"Rule: C={confluence_score}/28 ≥ {MIN_CONFLUENCE}. {reasons_str}")
             decision = {
                 "action": action, "confidence": conf, "mode": trade_mode,
                 "reasoning": reasoning,
@@ -655,6 +691,7 @@ class AutoTrader:
                 self._log("TRADE",
                     f"OPEN {mode_tag}LONG {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag} | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_long", **record})
+                get_journal().record("autotrader", symbol, "open_long", reasoning)
 
             elif action == "open_short" and not cur_pos:
                 self.position_stale_cycles[symbol] = 0
@@ -668,6 +705,7 @@ class AutoTrader:
                 self._log("TRADE",
                     f"OPEN {mode_tag}SHORT {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag} | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_short", **record})
+                get_journal().record("autotrader", symbol, "open_short", reasoning)
 
             elif action == "close_long" and cur_pos and cur_pos.side == "long":
                 record = self._close(symbol, price, close_reason)
@@ -675,6 +713,7 @@ class AutoTrader:
                 self._log("TRADE",
                     f"CLOSE LONG ({close_reason}) @ ${price:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
                     symbol, {"type": "close_long", **record})
+                get_journal().record("autotrader", symbol, "close_long", close_reason, pnl=record["pnl"])
 
             elif action == "close_short" and cur_pos and cur_pos.side == "short":
                 record = self._close(symbol, price, close_reason)
@@ -682,6 +721,7 @@ class AutoTrader:
                 self._log("TRADE",
                     f"CLOSE SHORT ({close_reason}) @ ${price:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
                     symbol, {"type": "close_short", **record})
+                get_journal().record("autotrader", symbol, "close_short", close_reason, pnl=record["pnl"])
 
             else:
                 self._log("INFO", f"HOLD (action={action}, pos={'open' if cur_pos else 'none'})", symbol)
@@ -714,12 +754,17 @@ class AutoTrader:
                             self._log("TRADE",
                                 f"PARTIAL TP1 (monitor) — 50% @ ${price:,.2f} | PnL: {record['pnl']:+.2f} | SL → Breakeven",
                                 symbol, {"type": "take_profit_1", **record})
+                            get_journal().record("autotrader", symbol, "partial_take_profit_1",
+                                                  "TP1 @ 1.5x ATR erreicht, 50% geschlossen, SL auf Breakeven",
+                                                  pnl=record["pnl"])
                         elif trigger:
                             pos = self.engine.get_position(symbol, price)
                             record = self._close(symbol, price, trigger)
                             self._log("TRADE",
                                 f"{trigger.upper()} (monitor) — closed {pos['side'].upper()} @ ${price:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
                                 symbol, {"type": trigger, **record})
+                            get_journal().record("autotrader", symbol, f"close_{pos['side']}", trigger,
+                                                  pnl=record["pnl"])
             except Exception as e:
                 self._log("ERROR", f"Monitor-Loop Fehler: {e}", "ALL")
 
@@ -1198,6 +1243,33 @@ class AutoTrader:
                 elif not is_long and cmc_bias in bearish_tiers:
                     pts = bearish_tiers[cmc_bias]
                     score += pts; reasons.append(f"CMC {cmc_bias} (score={sentiment.get('cmc_signal_score',0):+.1f}{fg_str})")
+
+            # 19. Reddit sentiment (keyword-count over r/CryptoCurrency + coin
+            # subreddit hot posts) — low weight (0-1 pt) since this is a coarse
+            # keyword count, not real NLP (DeepSeek's assessment 2026-07-23, see
+            # project memory: crypto subreddit sentiment is noisy on its own).
+            reddit_bias = sentiment.get("reddit_bias")
+            if reddit_bias == "bullish" and is_long:
+                score += 1; reasons.append(f"Reddit bullisch ({sentiment.get('reddit_bull',0)}↑/{sentiment.get('reddit_bear',0)}↓)")
+            elif reddit_bias == "bearish" and not is_long:
+                score += 1; reasons.append(f"Reddit bärisch ({sentiment.get('reddit_bull',0)}↑/{sentiment.get('reddit_bear',0)}↓)")
+
+            # 20. Liquidation flow (Binance forceOrder stream, free, no API key —
+            # see exchange/liquidation_stream.py; NOT a Coinglass price-level
+            # heatmap, that needs a $699+/mo Coinglass plan, checked 2026-07-23,
+            # no free tier despite an earlier assumption otherwise). Interpreted
+            # as momentum confirmation, not a contrarian "magnet" signal: heavy
+            # recent SHORT liquidations = a squeeze = bullish momentum; heavy
+            # recent LONG liquidations = a flush = bearish momentum. Only counts
+            # when the dominant side's liquidation volume is at least 1.5x the
+            # other side's (dominance_ratio) — otherwise it's just noise.
+            liq_side = sentiment.get("liq_dominant_side")
+            liq_ratio = sentiment.get("liq_dominance_ratio", 1.0)
+            if liq_side and liq_ratio >= 1.5:
+                if liq_side == "short" and is_long:
+                    score += 1; reasons.append(f"Short-Squeeze-Flow (${sentiment.get('liq_short_usd',0):,.0f} liquidiert, {liq_ratio:.1f}x)")
+                elif liq_side == "long" and not is_long:
+                    score += 1; reasons.append(f"Long-Flush-Flow (${sentiment.get('liq_long_usd',0):,.0f} liquidiert, {liq_ratio:.1f}x)")
 
         # No clamp-to-0 here (unlike the old single-direction version) — this gets
         # compared against the opposite direction's score via argmax in _run_symbol,

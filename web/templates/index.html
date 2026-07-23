@@ -343,6 +343,28 @@ button:disabled { opacity: 0.4; cursor: default; }
         <div class="stat"><div class="lbl">Pairs Trading</div><div class="val" id="pt-pairs">—</div></div>
       </div>
     </div>
+
+    <!-- Risiko-Kennzahlen -->
+    <div class="card">
+      <div class="card-title">Risiko-Kennzahlen (Gesamt-Portfolio)</div>
+      <div class="stats" style="margin-bottom:0">
+        <div class="stat"><div class="lbl">Sharpe Ratio</div><div class="val" id="pm-sharpe">—</div></div>
+        <div class="stat"><div class="lbl">Max Drawdown</div><div class="val" id="pm-maxdd">—</div></div>
+        <div class="stat"><div class="lbl">Return (Verlauf)</div><div class="val" id="pm-return">—</div></div>
+        <div class="stat"><div class="lbl">Datenpunkte</div><div class="val" id="pm-samples">—</div></div>
+      </div>
+    </div>
+
+    <!-- Trade Journal (letzte Einträge) -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <div class="card-title">Trade Journal — letzte Entscheidungen</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Zeit</th><th>Engine</th><th>Symbol</th><th>Aktion</th><th>Begründung</th><th>PnL</th></tr></thead>
+          <tbody id="journal-tbody"><tr><td colspan="6" style="color:var(--muted)">Lädt…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1805,6 +1827,47 @@ setInterval(refreshPortfolioTotal, 30000);
 refreshBalance();
 setInterval(refreshBalance, 30000);
 setInterval(refreshWhales, 60000);
+
+async function refreshPortfolioMetrics() {
+  try {
+    const d = await (await fetch('/api/portfolio/metrics')).json();
+    const c = d.combined || {};
+    set('pm-sharpe', c.sharpe === null || c.sharpe === undefined ? 'n/a' : fmt(c.sharpe));
+    const ddEl = document.getElementById('pm-maxdd');
+    if (ddEl) { ddEl.textContent = c.max_drawdown_pct === null ? 'n/a' : fmt(c.max_drawdown_pct) + '%'; ddEl.style.color = 'var(--red)'; }
+    const retEl = document.getElementById('pm-return');
+    if (retEl) {
+      if (c.return_pct === null || c.return_pct === undefined) { retEl.textContent = 'n/a'; }
+      else { retEl.textContent = pnlStr(c.return_pct, '%'); retEl.style.color = pnlColor(c.return_pct); }
+    }
+    set('pm-samples', c.sample_size ?? '—');
+  } catch(e) { console.error('refreshPortfolioMetrics:', e); }
+}
+refreshPortfolioMetrics();
+setInterval(refreshPortfolioMetrics, 30000);
+
+const ENGINE_LABELS = {
+  autotrader: 'AutoTrader', funding_harvest: 'Funding Harvest',
+  mean_reversion: 'Mean Reversion', pairs_trading: 'Pairs Trading',
+};
+async function refreshJournal() {
+  try {
+    const rows = await (await fetch('/api/journal?limit=40')).json();
+    const tbody = document.getElementById('journal-tbody');
+    if (!tbody) return;
+    if (!rows.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">Noch keine Einträge</td></tr>'; return; }
+    tbody.innerHTML = rows.map(r => {
+      const time = (r.ts || '').slice(11, 19);
+      const engine = ENGINE_LABELS[r.engine] || r.engine;
+      const pnlTxt = (r.pnl === null || r.pnl === undefined) ? '—' :
+        `<span style="color:${pnlColor(r.pnl)}">${pnlStr(r.pnl)}</span>`;
+      return `<tr><td>${time}</td><td>${engine}</td><td>${r.symbol}</td><td>${r.action}</td>` +
+             `<td style="color:var(--muted); font-size:12px;">${r.reason || ''}</td><td>${pnlTxt}</td></tr>`;
+    }).join('');
+  } catch(e) { console.error('refreshJournal:', e); }
+}
+refreshJournal();
+setInterval(refreshJournal, 20000);
 
 // ── Funding Harvest ────────────────────────────────────────────────────────
 async function startFundingHarvest() {
