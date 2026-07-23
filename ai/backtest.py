@@ -141,11 +141,20 @@ def run_backtest(
     leverage: int = 5,
     max_position_pct: float = 0.20,   # cap: max margin per trade as % of equity (mirrors RiskConfig)
     default_risk_pct: float = 0.015,  # fallback risk-per-trade until Kelly has enough history
+    reverse: bool = False,        # flip every long<->short (see param docstring below)
     progress_cb=None,             # optional callable(str) for live progress log
 ) -> dict:
     """
     Walk-forward MTF backtest.
     Returns metrics dict + trade_log list.
+
+    reverse: trade the OPPOSITE of every decision (long entries become short and
+    vice versa) — SL/TP are flipped to match so R:R stays 1:2 in the new direction,
+    sizing/thresholds/everything else is unchanged. Useful as a quick diagnostic:
+    if reversing consistently helps, the signal has a real but inverted edge (a
+    systematic bias worth investigating, e.g. in labeling or a sign error) rather
+    than just being noise — a signal with no real edge stays roughly breakeven
+    (net of fees, negative) either way.
     """
     def _progress(msg: str):
         if progress_cb:
@@ -334,6 +343,8 @@ def run_backtest(
 
         # ── Open trade (Kelly-scaled ATR position sizing, mirrors AutoTrader) ────
         side  = "long" if score_long >= score_short else "short"
+        if reverse:
+            side = "short" if side == "long" else "long"
         sl    = price - atr * atr_sl_mult if side == "long" else price + atr * atr_sl_mult
         tp    = price + atr * atr_tp_mult if side == "long" else price - atr * atr_tp_mult
 
@@ -478,6 +489,7 @@ def run_backtest(
             "atr_sl_mult":    atr_sl_mult,
             "atr_tp_mult":    atr_tp_mult,
             "leverage":       leverage,
+            "reverse":        reverse,
         },
         "trades":          len(trades),
         "longs":           longs,

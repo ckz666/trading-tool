@@ -71,6 +71,18 @@ class FuturesPosition:
 
     def to_dict(self, current_price: float = None) -> dict:
         upnl = self.unrealized_pnl(current_price) if current_price else 0
+        # "unrealized_pnl"/"roe_pct" are pure price movement — a position shows
+        # ~0 right after opening even though the entry fee (and, once accrued,
+        # funding) is already a real, sunk cost. net_pnl/net_roe_pct answer "what
+        # would I actually walk away with if I closed this right now": entry fee
+        # (paid already) + an estimated exit fee at the current price (what
+        # close_position() would actually charge) + funding paid so far.
+        # See project memory, uPnL discrepancy report 2026-07-23.
+        net_pnl = 0.0
+        if current_price:
+            entry_fee = self.amount * self.entry_price * TAKER_FEE
+            est_exit_fee = self.amount * current_price * TAKER_FEE
+            net_pnl = upnl - entry_fee - est_exit_fee - self.funding_paid
         return {
             "symbol": self.symbol,
             "side": self.side,
@@ -85,6 +97,8 @@ class FuturesPosition:
             "partial_closed": self.partial_closed,
             "unrealized_pnl": round(upnl, 4),
             "roe_pct": round(self.roe(current_price) if current_price else 0, 2),
+            "net_pnl": round(net_pnl, 4),
+            "net_roe_pct": round(net_pnl / self.margin * 100, 2) if self.margin else 0,
             "opened_at": self.opened_at,
             "funding_paid": round(self.funding_paid, 4),
             "trailing_sl": self.trailing_sl,
@@ -202,6 +216,13 @@ class FuturesPaperEngine:
 
         liq_price = calc_liquidation_price(price, side, leverage)
         self.wallet.balance -= (margin + fee)
+        # Entry fee is a real, immediate cost (already deducted from wallet.balance
+        # above) but close_position()/partial_close_position() only ever net the EXIT
+        # fee into total_pnl — entry fees were silently never counted, making total_pnl
+        # (and anything displaying it, e.g. the AutoTrader tab) systematically overstate
+        # performance vs. the true wallet-balance-derived total ([[project-trading-roadmap]],
+        # discrepancy report 2026-07-23). Recognise it here, symmetric with the exit fee.
+        self.total_pnl -= fee
 
         # Partial TP1 at 50% of full TP distance from entry
         if side == "long":
@@ -366,10 +387,18 @@ class FuturesPaperEngine:
 
     def status(self, prices: dict = None) -> dict:
         prices = prices or {}
+        unrealized = sum(pos.unrealized_pnl(prices[sym])
+                          for sym, pos in self.positions.items() if sym in prices)
         return {
             "balance": round(self.wallet.balance, 2),
             "portfolio_value": round(self.portfolio_value(prices), 2),
-            "total_pnl": round(self.total_pnl, 2),
+            "total_pnl": round(self.total_pnl, 2),   # realised only (closed trades, all fees)
+            # Realised + currently-open positions' unrealised PnL — matches what
+            # /api/portfolio/total shows for this engine's own scope (that endpoint
+            # additionally spans Grid/FundingHarvest via the shared wallet balance,
+            # this one doesn't, so the two can still differ when those engines have
+            # their own separate PnL — see project memory, discrepancy report 2026-07-23).
+            "total_pnl_live": round(self.total_pnl + unrealized, 2),
             "open_positions": len(self.positions),
             "positions": {sym: pos.to_dict(prices.get(sym)) for sym, pos in self.positions.items()},
             "trade_count": len(self.trade_history),

@@ -609,6 +609,8 @@ button:disabled { opacity: 0.4; cursor: default; }
           <input id="bt-conf" type="number" value="0.55" min="0.40" max="0.99" step="0.05" style="width:80px;"></div>
         <div class="fg"><label>Leverage</label>
           <input id="bt-lev" type="number" value="5" min="1" max="10" style="width:70px;"></div>
+        <div class="fg"><label title="Jede Long/Short-Entscheidung umkehren — Diagnose, ob das Signal einen invertierten statt fehlenden Edge hat">Reverse</label>
+          <input id="bt-reverse" type="checkbox" style="width:20px;height:20px;align-self:center;"></div>
         <button class="primary" onclick="runMtfBacktest()" style="align-self:flex-end;">Starten</button>
       </div>
       <div id="bt-log" class="log" style="display:none; max-height:220px; overflow-y:auto; margin-bottom:12px;"></div>
@@ -981,6 +983,7 @@ async function runMtfBacktest() {
     min_confluence: parseInt(document.getElementById('bt-confluence').value),
     min_conf:       parseFloat(document.getElementById('bt-conf').value),
     leverage:       parseInt(document.getElementById('bt-lev').value),
+    reverse:        document.getElementById('bt-reverse').checked,
   };
   try {
     const r = await fetch('/api/backtest/mtf', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
@@ -1203,7 +1206,7 @@ async function pollAutotraderStatus() {
 
   if (s.engine) {
     const e = s.engine;
-    const pnl = e.total_pnl || 0;
+    const pnl = e.total_pnl_live ?? e.total_pnl ?? 0;
     set('ft-balance',   '$' + fmt(e.balance));
     set('ft-portfolio', '$' + fmt(e.portfolio_value));
     set('ft-openpos',   e.open_positions || 0);
@@ -1370,8 +1373,13 @@ function renderPositions(positions) {
   tbody.innerHTML = '';
   positions.forEach(p => {
     const isLong = p.side === 'long';
-    const pnl = p.unrealized_pnl || 0;
-    const roe = p.roe_pct || 0;
+    // net_pnl/net_roe_pct include entry+estimated-exit fee and funding paid so
+    // far — what you'd actually walk away with if you closed now, not just the
+    // raw price move (which shows ~0 right after opening despite the fee already
+    // being a real cost). Falls back to the old fields if an older API response
+    // doesn't have them yet.
+    const pnl = p.net_pnl ?? p.unrealized_pnl ?? 0;
+    const roe = p.net_roe_pct ?? p.roe_pct ?? 0;
     const pc  = pnlColor(pnl);
     const row = document.createElement('tr');
     const modeBadge = p.mode === 'scalp' ? ' <span class="pill pill-blue" title="Ranging-Markt erkannt (ADX&lt;20) — Mean-Reversion statt Trend-Signal">⚡ Scalp</span>' : '';

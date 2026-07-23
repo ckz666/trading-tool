@@ -143,8 +143,19 @@ def simulate_from_table(
     min_conf: float = 0.40, atr_sl_mult: float = 1.5, atr_tp_mult: float = 3.0,
     fee_pct: float = 0.0006, leverage: int = 5, max_position_pct: float = 0.20,
     default_risk_pct: float = 0.015,
+    sl_tp_mode: str = "atr", fixed_sl_pct: float = 0.015, fixed_tp_pct: float = 0.03,
+    reverse: bool = False,
 ) -> dict:
-    """Cheap decision + PnL simulation over a precomputed signal table."""
+    """
+    Cheap decision + PnL simulation over a precomputed signal table.
+    sl_tp_mode: "atr" (default, SL/TP = atr_sl_mult/atr_tp_mult * current ATR — adapts
+    per-symbol/per-regime) or "fixed_pct" (SL/TP = fixed_sl_pct/fixed_tp_pct off entry
+    price, same distance regardless of volatility — see project memory, 2026-07-23
+    fixed-vs-ATR-stop discussion for why this is a proof-of-concept comparison mode,
+    not a recommended default).
+    reverse: flip every long<->short decision (SL/TP flipped to match). See
+    ai/backtest.py::run_backtest's reverse docstring for the diagnostic rationale.
+    """
     trades = []
     open_trade: Optional[dict] = None
     cash = 1000.0
@@ -200,8 +211,15 @@ def simulate_from_table(
             if side != label_side:
                 continue
 
-        sl = price - atr * atr_sl_mult if side == "long" else price + atr * atr_sl_mult
-        tp = price + atr * atr_tp_mult if side == "long" else price - atr * atr_tp_mult
+        if reverse:
+            side = "short" if side == "long" else "long"
+
+        if sl_tp_mode == "fixed_pct":
+            sl = price * (1 - fixed_sl_pct) if side == "long" else price * (1 + fixed_sl_pct)
+            tp = price * (1 + fixed_tp_pct) if side == "long" else price * (1 - fixed_tp_pct)
+        else:
+            sl = price - atr * atr_sl_mult if side == "long" else price + atr * atr_sl_mult
+            tp = price + atr * atr_tp_mult if side == "long" else price - atr * atr_tp_mult
         equity = cash
         risk_pct = (_risk.kelly_risk_pct(closed_pnls) or default_risk_pct) * row.vol_risk_mult
         risk_amount = equity * risk_pct

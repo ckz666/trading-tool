@@ -271,6 +271,7 @@ class MtfBacktestRequest(BaseModel):
     atr_sl_mult: float = 1.5
     atr_tp_mult: float = 3.0
     leverage: int = 5
+    reverse: bool = False   # trade the opposite of every decision — see ai/backtest.py::run_backtest docstring
 
 
 @app.post("/api/backtest/mtf")
@@ -323,7 +324,7 @@ async def run_mtf_backtest_endpoint(req: MtfBacktestRequest):
                 train_pct=req.train_pct, min_confluence=req.min_confluence,
                 min_conf=req.min_conf, atr_sl_mult=req.atr_sl_mult,
                 atr_tp_mult=req.atr_tp_mult, leverage=req.leverage,
-                progress_cb=_progress,
+                reverse=req.reverse, progress_cb=_progress,
             )
         )
     result["data_source"] = req.data_source
