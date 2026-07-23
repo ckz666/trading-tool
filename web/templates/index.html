@@ -311,6 +311,9 @@ button:disabled { opacity: 0.4; cursor: default; }
   <button class="nav-tab" onclick="showTab('meanrev', this)">
     <span class="tab-icon">↔</span>Mean Rev
   </button>
+  <button class="nav-tab" onclick="showTab('pairs', this)">
+    <span class="tab-icon">⇄</span>Pairs
+  </button>
 </nav>
 
 <!-- ══════════════════════ DASHBOARD ══════════════════════ -->
@@ -336,6 +339,7 @@ button:disabled { opacity: 0.4; cursor: default; }
         <div class="stat"><div class="lbl">Funding Harvest</div><div class="val" id="pt-fh">—</div></div>
         <div class="stat"><div class="lbl">Grid Trading</div><div class="val" id="pt-grid">—</div></div>
         <div class="stat"><div class="lbl">Mean Reversion</div><div class="val" id="pt-mr">—</div></div>
+        <div class="stat"><div class="lbl">Pairs Trading</div><div class="val" id="pt-pairs">—</div></div>
       </div>
     </div>
   </div>
@@ -863,6 +867,91 @@ button:disabled { opacity: 0.4; cursor: default; }
   </div>
 </div>
 
+<!-- ══════════════════════ PAIRS TRADING ══════════════════════ -->
+<div id="tab-pairs" class="page">
+  <div class="grid2" style="margin-bottom:12px;">
+
+    <!-- Config -->
+    <div class="card">
+      <div class="card-title">Pairs Trading (ETH/BTC-Spread)</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.5;">
+        Marktneutral: Long im relativ unterbewerteten, Short im überbewerteten Asset, basierend auf dem
+        rollierenden Z-Score von log(ETH/BTC). Rendite kommt aus der Spread-Konvergenz, nicht aus der
+        Marktrichtung — bleibt profitabel selbst wenn beide Assets gemeinsam fallen, solange sich der Spread normalisiert.
+      </div>
+      <div class="cfg-grid">
+        <div class="fg"><label>Symbol A / B</label>
+          <input id="pr-sym-a" type="text" value="ETH/USDT" style="width:90px;">
+          <input id="pr-sym-b" type="text" value="BTC/USDT" style="width:90px;"></div>
+        <div class="fg"><label>Scan-Intervall (Sek.)</label>
+          <input id="pr-interval" type="number" value="300" min="60"></div>
+        <div class="fg"><label>Fenster (Bars)</label>
+          <input id="pr-window" type="number" value="200" min="30"></div>
+        <div class="fg"><label>Z Entry / Exit / Stop</label>
+          <input id="pr-z-entry" type="number" value="2.0" step="0.1" style="width:55px;">
+          <input id="pr-z-exit" type="number" value="0.0" step="0.1" style="width:55px;">
+          <input id="pr-z-stop" type="number" value="3.0" step="0.1" style="width:55px;"></div>
+        <div class="fg"><label>Max Haltedauer (Bars)</label>
+          <input id="pr-maxhold" type="number" value="48" min="1"></div>
+        <div class="fg"><label>Leverage</label>
+          <input id="pr-leverage" type="number" value="3" min="1" max="10"></div>
+        <div class="fg"><label>Risiko % / Trade</label>
+          <input id="pr-risk" type="number" value="1.0" min="0.1" step="0.1"></div>
+        <div class="fg"><label>Max % Kapital gesamt</label>
+          <input id="pr-maxmargin" type="number" value="20" min="5" max="100"></div>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="primary" id="pr-start-btn" onclick="startPairsTrading()" style="flex:1">▶ Start</button>
+        <button class="danger"  id="pr-stop-btn"  onclick="stopPairsTrading()" style="flex:1" disabled>■ Stop</button>
+      </div>
+    </div>
+
+    <!-- Status -->
+    <div class="card">
+      <div class="card-title">Status</div>
+      <div class="stats" style="margin-bottom:12px;">
+        <div class="stat"><div class="lbl">Balance</div><div class="val" id="pr-balance">—</div></div>
+        <div class="stat"><div class="lbl">Portfolio</div><div class="val" id="pr-portfolio">—</div></div>
+        <div class="stat"><div class="lbl">PnL (live)</div><div class="val" id="pr-pnl-live">—</div></div>
+        <div class="stat"><div class="lbl">Aktueller Z-Score</div><div class="val" id="pr-last-z">—</div></div>
+      </div>
+      <div id="pr-pair-status" style="font-size:12px;color:var(--muted);"></div>
+    </div>
+  </div>
+
+  <!-- Positions -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">Offene Beine (<span id="pr-pos-count">0</span>)</div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Seite</th><th>Entry</th><th>Aktuell</th><th>Netto P&L</th><th>ROE</th>
+        </tr></thead>
+        <tbody id="pr-positions-body"><tr class="empty-row"><td colspan="6">Keine offenen Positionen</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- History -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">Historie (<span id="pr-history-count">0</span>)</div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead><tr>
+          <th>Zeit</th><th>Symbol</th><th>Aktion</th><th>Entry</th><th>Exit</th><th>PnL</th><th>ROE</th><th>Grund</th>
+        </tr></thead>
+        <tbody id="pr-history-body"><tr class="empty-row"><td colspan="8">Keine Trades</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="card">
+    <div class="card-title">Log</div>
+    <div id="pr-log" class="log" style="max-height:260px;"></div>
+  </div>
+</div>
+
 <script>
 // ── WebSocket ──────────────────────────────────────────────────────────────
 const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -898,6 +987,9 @@ function showTab(name, btn) {
   }
   if (name === 'meanrev') {
     refreshMeanReversion();
+  }
+  if (name === 'pairs') {
+    refreshPairsTrading();
   }
 }
 
@@ -1694,6 +1786,7 @@ async function refreshPortfolioTotal() {
     set('pt-fh',   '$' + fmt(d.funding_harvest_positions_value));
     set('pt-grid', '$' + fmt(d.grid_positions_value));
     set('pt-mr',   '$' + fmt(d.mean_reversion_positions_value));
+    set('pt-pairs','$' + fmt(d.pairs_trading_positions_value));
   } catch(e) { console.error('refreshPortfolioTotal:', e); }
 }
 
@@ -1959,6 +2052,134 @@ async function refreshMeanReversion() {
   } catch(e) { console.error('refreshMeanReversion:', e); }
 }
 
+// ── Pairs Trading ──────────────────────────────────────────────────────────
+async function startPairsTrading() {
+  const body = {
+    symbol_a: document.getElementById('pr-sym-a').value.trim().toUpperCase(),
+    symbol_b: document.getElementById('pr-sym-b').value.trim().toUpperCase(),
+    interval_seconds: Number(document.getElementById('pr-interval').value),
+    window: Number(document.getElementById('pr-window').value),
+    z_entry: Number(document.getElementById('pr-z-entry').value),
+    z_exit: Number(document.getElementById('pr-z-exit').value),
+    z_stop: Number(document.getElementById('pr-z-stop').value),
+    max_hold_bars: Number(document.getElementById('pr-maxhold').value),
+    leverage: Number(document.getElementById('pr-leverage').value),
+    risk_pct: Number(document.getElementById('pr-risk').value) / 100,
+    max_total_margin_pct: Number(document.getElementById('pr-maxmargin').value) / 100,
+  };
+  try {
+    const r = await fetch('/api/pairs-trading/start', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    if (!r.ok) { const e = await r.json(); alert('Start fehlgeschlagen: ' + (e.detail || r.status)); return; }
+    document.getElementById('pr-start-btn').disabled = true;
+    document.getElementById('pr-start-btn').textContent = 'Läuft...';
+    document.getElementById('pr-stop-btn').disabled = false;
+    refreshPairsTrading();
+  } catch(e) { alert('Start fehlgeschlagen: ' + e); }
+}
+
+async function stopPairsTrading() {
+  try {
+    await fetch('/api/pairs-trading/stop', { method: 'POST' });
+    document.getElementById('pr-start-btn').disabled = false;
+    document.getElementById('pr-start-btn').textContent = '▶ Start';
+    document.getElementById('pr-stop-btn').disabled = true;
+  } catch(e) { alert('Stop fehlgeschlagen: ' + e); }
+}
+
+function renderPairsPositions(positions) {
+  const tbody = document.getElementById('pr-positions-body');
+  const entries = Object.entries(positions || {});
+  document.getElementById('pr-pos-count').textContent = entries.length;
+  if (!entries.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">Keine offenen Positionen</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  entries.forEach(([sym, p]) => {
+    const pnl = p.net_pnl ?? p.unrealized_pnl ?? 0;
+    const roe = p.net_roe_pct ?? p.roe_pct ?? 0;
+    const pc = pnlColor(pnl);
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td style="font-weight:700">${sym.replace('/USDT','')}</td>
+      <td style="color:${p.side==='long'?'var(--green)':'var(--red)'}">${p.side==='long'?'Long':'Short'}</td>
+      <td>$${fmt(p.entry_price)}</td>
+      <td>${p.current_price!=null ? '$'+fmt(p.current_price) : '—'}</td>
+      <td style="color:${pc};font-weight:700">${pnlStr(pnl)}</td>
+      <td style="color:${pc}">${roe>=0?'+':''}${roe.toFixed(1)}%</td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+function renderPairsHistory(trades) {
+  const tbody = document.getElementById('pr-history-body');
+  document.getElementById('pr-history-count').textContent = trades.length;
+  if (!trades.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Keine Trades</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  trades.forEach(t => {
+    const pc = t.pnl != null ? pnlColor(t.pnl) : 'var(--muted)';
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td class="muted">${fmtTime(t.ts)}</td>
+      <td style="font-weight:700">${(t.symbol||'—').replace('/USDT','')}</td>
+      <td>${(t.action||'—').replace('close_','').replace('_',' ')}</td>
+      <td>${t.entry_price!=null ? '$'+fmt(t.entry_price) : '—'}</td>
+      <td>${t.exit_price!=null ? '$'+fmt(t.exit_price) : '—'}</td>
+      <td style="color:${pc};font-weight:700">${t.pnl!=null ? pnlStr(t.pnl) : '—'}</td>
+      <td style="color:${pc}">${t.roe_pct!=null ? (t.roe_pct>=0?'+':'')+t.roe_pct.toFixed(1)+'%' : '—'}</td>
+      <td class="muted">${t.reason || '—'}</td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+async function refreshPairsTrading() {
+  try {
+    const s = await (await fetch('/api/pairs-trading/status')).json();
+    document.getElementById('pr-start-btn').disabled = !!s.running;
+    document.getElementById('pr-start-btn').textContent = s.running ? 'Läuft...' : '▶ Start';
+    document.getElementById('pr-stop-btn').disabled = !s.running;
+
+    const eng = s.engine || {};
+    document.getElementById('pr-balance').textContent = eng.balance != null ? '$' + fmt(eng.balance) : '—';
+    document.getElementById('pr-portfolio').textContent = eng.portfolio_value != null ? '$' + fmt(eng.portfolio_value) : '—';
+    const pnl = eng.total_pnl_live ?? eng.total_pnl ?? 0;
+    const pnlEl = document.getElementById('pr-pnl-live');
+    pnlEl.textContent = pnlStr(pnl, ' USDT');
+    pnlEl.style.color = pnlColor(pnl);
+    document.getElementById('pr-last-z').textContent = s.last_z != null ? s.last_z.toFixed(2) : '—';
+
+    const pairStatusEl = document.getElementById('pr-pair-status');
+    pairStatusEl.textContent = s.open_pair
+      ? `Offenes Paar: ${s.open_pair.direction} | Entry-Z: ${s.open_pair.entry_z.toFixed(2)} | seit Bar ${s.open_pair.opened_bar}`
+      : 'Kein offenes Paar — wartet auf |Z| ≥ Entry-Schwelle';
+
+    renderPairsPositions(eng.positions);
+
+    const history = await (await fetch('/api/pairs-trading/history?limit=50')).json();
+    renderPairsHistory(history);
+
+    const log = await (await fetch('/api/pairs-trading/log?limit=50')).json();
+    const logEl = document.getElementById('pr-log');
+    logEl.innerHTML = '';
+    log.slice().reverse().forEach(entry => {
+      const line = document.createElement('div');
+      line.className = 'log-line ' + (entry.level || '');
+      const sym = entry.symbol && entry.symbol !== 'ALL' ? `[${entry.symbol.replace('/USDT','')}] ` : '';
+      line.textContent = `[${fmtTime(entry.ts)}] ${sym}${entry.msg}`;
+      logEl.appendChild(line);
+    });
+
+    setTimeout(refreshPairsTrading, s.running ? 8000 : 15000);
+  } catch(e) { console.error('refreshPairsTrading:', e); }
+}
+
 // ── Grid Trading ───────────────────────────────────────────────────────────
 async function startGrid() {
   const symbols = document.getElementById('gr-symbols').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
@@ -2119,6 +2340,15 @@ async function refreshGrid() {
     }
     refreshMeanReversion();
   } catch(e) { console.warn('Mean reversion init check failed:', e); }
+  try {
+    const ps = await (await fetch('/api/pairs-trading/status')).json();
+    if (ps.running) {
+      document.getElementById('pr-start-btn').textContent = 'Läuft...';
+      document.getElementById('pr-start-btn').disabled = true;
+      document.getElementById('pr-stop-btn').disabled = false;
+    }
+    refreshPairsTrading();
+  } catch(e) { console.warn('Pairs trading init check failed:', e); }
 })();
 </script>
 </body>

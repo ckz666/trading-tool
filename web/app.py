@@ -18,6 +18,7 @@ from ai.backtest import run_backtest as run_mtf_backtest
 from trading.autotrader import AutoTrader
 from trading.funding_harvest import FundingHarvestEngine, FundingHarvester
 from trading.mean_reversion import MeanReversionHarvester, MR_STATE_FILE
+from trading.pairs_trading import PairsTradingHarvester, PAIRS_STATE_FILE
 from trading.grid import GridEngine, GridTrader
 from trading.wallet import SharedWallet
 from trading.risk import RiskConfig
@@ -46,6 +47,9 @@ _grid_trader_starting = False
 mean_reversion_engine = FuturesPaperEngine(wallet=shared_wallet, state_file=MR_STATE_FILE)
 mean_reversion_harvester: MeanReversionHarvester = None
 _mean_reversion_starting = False
+pairs_trading_engine = FuturesPaperEngine(wallet=shared_wallet, state_file=PAIRS_STATE_FILE)
+pairs_trading_harvester: PairsTradingHarvester = None
+_pairs_trading_starting = False
 _price_cache: dict[str, dict] = {}
 _ws_clients: list[WebSocket] = []
 
@@ -90,6 +94,10 @@ async def _price_poll_loop():
                     for sym in mean_reversion_harvester.symbols:
                         if sym not in WATCH_SYMBOLS:
                             WATCH_SYMBOLS.append(sym)
+                if pairs_trading_harvester:
+                    for sym in (pairs_trading_harvester.symbol_a, pairs_trading_harvester.symbol_b):
+                        if sym not in WATCH_SYMBOLS:
+                            WATCH_SYMBOLS.append(sym)
 
                 for sym in list(WATCH_SYMBOLS):
                     try:
@@ -114,6 +122,8 @@ async def _price_poll_loop():
                         grid_trader.live_prices[sym] = price
                     if mean_reversion_harvester:
                         mean_reversion_harvester.live_prices[sym] = price
+                    if pairs_trading_harvester:
+                        pairs_trading_harvester.live_prices[sym] = price
 
                 await _broadcast({"type": "prices", "data": list(_price_cache.values())})
                 # equity snapshot every cycle (works with or without AutoTrader)
@@ -698,6 +708,81 @@ def mean_reversion_log(limit: int = 50):
     return mean_reversion_harvester.get_log(limit)
 
 
+# ── Pairs Trading (market-neutral ETH/BTC spread mean-reversion — see project memory) ──
+class PairsTradingStartRequest(BaseModel):
+    symbol_a: str = "ETH/USDT"
+    symbol_b: str = "BTC/USDT"
+    interval_seconds: int = 300
+    window: int = 200
+    z_entry: float = 2.0
+    z_exit: float = 0.0
+    z_stop: float = 3.0
+    max_hold_bars: int = 48
+    risk_pct: float = 0.01
+    leverage: int = 3
+    max_total_margin_pct: float = 0.20
+    funding_diff_floor: float = -0.001
+
+
+@app.post("/api/pairs-trading/start")
+async def start_pairs_trading(req: PairsTradingStartRequest):
+    global pairs_trading_harvester, _pairs_trading_starting
+    if _pairs_trading_starting or (pairs_trading_harvester and pairs_trading_harvester.running):
+        raise HTTPException(400, "PairsTradingHarvester already running")
+    _pairs_trading_starting = True
+    try:
+        pairs_trading_harvester = PairsTradingHarvester(
+            symbol_a=req.symbol_a,
+            symbol_b=req.symbol_b,
+            engine=pairs_trading_engine,
+            interval_seconds=req.interval_seconds,
+            window=req.window,
+            z_entry=req.z_entry,
+            z_exit=req.z_exit,
+            z_stop=req.z_stop,
+            max_hold_bars=req.max_hold_bars,
+            risk_pct=req.risk_pct,
+            leverage=req.leverage,
+            max_total_margin_pct=req.max_total_margin_pct,
+            funding_diff_floor=req.funding_diff_floor,
+        )
+        pairs_trading_harvester.start()
+        return {"status": "started"}
+    finally:
+        _pairs_trading_starting = False
+
+
+@app.post("/api/pairs-trading/stop")
+async def stop_pairs_trading():
+    if not pairs_trading_harvester or not pairs_trading_harvester.running:
+        raise HTTPException(400, "PairsTradingHarvester not running")
+    await pairs_trading_harvester.stop()
+    return {"status": "stopped"}
+
+
+@app.get("/api/pairs-trading/status")
+async def pairs_trading_status():
+    prices = {sym: d["price"] for sym, d in _price_cache.items()}
+    base = pairs_trading_harvester.status() if pairs_trading_harvester else {"running": False}
+    engine_status = pairs_trading_engine.status(prices)
+    for sym, pos in engine_status.get("positions", {}).items():
+        pos["current_price"] = prices.get(sym)
+    base["engine"] = engine_status
+    return base
+
+
+@app.get("/api/pairs-trading/history")
+def pairs_trading_history(limit: int = 50):
+    return list(reversed(pairs_trading_engine.trade_history[-limit:]))
+
+
+@app.get("/api/pairs-trading/log")
+def pairs_trading_log(limit: int = 50):
+    if not pairs_trading_harvester:
+        return []
+    return pairs_trading_harvester.get_log(limit)
+
+
 # ── Grid Trading (structural range-oscillation edge, separate from everything else) ──
 class GridStartRequest(BaseModel):
     symbols: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
@@ -840,8 +925,12 @@ async def portfolio_total():
     mr_value = mean_reversion_engine.portfolio_value(mr_prices)
     mr_positions_value = mr_value - shared_wallet.balance
 
+    pairs_prices = {sym: d["price"] for sym, d in _price_cache.items()}
+    pairs_value = pairs_trading_engine.portfolio_value(pairs_prices)
+    pairs_positions_value = pairs_value - shared_wallet.balance
+
     total = (shared_wallet.balance + futures_positions_value + harvest_positions_value
-             + grid_positions_value + mr_positions_value)
+             + grid_positions_value + mr_positions_value + pairs_positions_value)
     return {
         "shared_balance": round(shared_wallet.balance, 2),
         "initial_balance": shared_wallet.initial_balance,
@@ -849,6 +938,7 @@ async def portfolio_total():
         "funding_harvest_positions_value": round(harvest_positions_value, 2),
         "grid_positions_value": round(grid_positions_value, 2),
         "mean_reversion_positions_value": round(mr_positions_value, 2),
+        "pairs_trading_positions_value": round(pairs_positions_value, 2),
         "total_portfolio_value": round(total, 2),
         "total_pnl": round(total - shared_wallet.initial_balance, 2),
     }
