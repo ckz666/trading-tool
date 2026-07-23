@@ -90,18 +90,30 @@ class RiskManager:
     def check_drawdown(self, portfolio_value: float) -> bool:
         """Returns False (block new entries) if equity dropped >max_drawdown_pct from peak.
         Existing positions are still managed (SL/TP still fires), only new entries blocked.
+
+        self.blocked/block_reason are re-evaluated fresh on every call (cleared
+        here when the drawdown is no longer breached) rather than only ever being
+        set — they used to latch on once triggered and never clear, so the status
+        display could keep showing a stale "blocked" reason long after the
+        portfolio had recovered, even though check_drawdown's return value itself
+        (which actually gates new entries) was already correctly re-computed each
+        time — a real display bug, not a trading-logic one, but confusing enough
+        that the user noticed it looked wrong (2026-07-23, see project memory).
         """
         if portfolio_value > self.peak_equity:
             self.peak_equity = portfolio_value
         if self.peak_equity > 0:
             drawdown = (self.peak_equity - portfolio_value) / self.peak_equity
             if drawdown >= self.config.max_drawdown_pct:
+                self.blocked = True
                 self.block_reason = (
                     f"Drawdown-Breaker: {drawdown:.1%} unter Peak "
                     f"(Peak ${self.peak_equity:,.0f} → aktuell ${portfolio_value:,.0f})"
                 )
                 self._save_state()
                 return False
+        self.blocked = False
+        self.block_reason = ""
         self._save_state()
         return True
 
@@ -112,7 +124,10 @@ class RiskManager:
         daily_pnl-only check couldn't see a large loss on a position that was
         still open — it only reacted once that position actually closed, by
         which point the loss had already happened. day_start_equity is seeded
-        on the first-ever call and re-seeded at each day rollover."""
+        on the first-ever call and re-seeded at each day rollover.
+
+        Same self.blocked/block_reason clear-on-recovery fix as check_drawdown
+        above — see that docstring."""
         if self.day_start_equity <= 0:
             self.day_start_equity = portfolio_value
         self._reset_daily_if_needed(portfolio_value)
@@ -126,6 +141,8 @@ class RiskManager:
                 )
                 self._save_state()
                 return False
+        self.blocked = False
+        self.block_reason = ""
         self._save_state()
         return True
 

@@ -433,6 +433,7 @@ async def start_autotrader(req: AutotraderStartRequest):
             neutral_zone=req.neutral_zone,
             ml_weight=req.ml_weight,
             skip_contra=req.skip_contra,
+            portfolio_value_fn=compute_total_portfolio_value_cached,
         )
         _add_watch_symbols(req.symbols)
         train_results = await autotrader.startup()
@@ -886,6 +887,28 @@ def grid_log(limit: int = 50):
     if not grid_trader:
         return []
     return grid_trader.log[-limit:]
+
+
+def compute_total_portfolio_value_cached() -> float:
+    """Cheap, synchronous approximation of the true combined equity across every
+    engine sharing the wallet, using only the continuously-updated price cache
+    (no live spot/perp/grid API fetches like /api/portfolio/total does) — good
+    enough for a risk-check safety net that needs to run on every single
+    symbol's cycle in AutoTrader, not precise enough to be the number actually
+    displayed on the dashboard (that stays /api/portfolio/total). Injected into
+    AutoTrader as portfolio_value_fn — see its docstring for the bug this fixes:
+    AutoTrader's own narrow self.engine.portfolio_value() is blind to capital
+    the OTHER engines hold, and could trip the daily-loss/drawdown breakers on
+    money that's simply parked elsewhere, not actually lost."""
+    prices = {sym: d["price"] for sym, d in _price_cache.items()}
+    total = shared_wallet.balance
+    total += futures_paper.portfolio_value(prices) - shared_wallet.balance
+    total += mean_reversion_engine.portfolio_value(prices) - shared_wallet.balance
+    total += pairs_trading_engine.portfolio_value(prices) - shared_wallet.balance
+    harvest_prices = {sym: {"spot": px, "perp": px} for sym, px in prices.items()}
+    total += funding_harvest_engine.portfolio_value(harvest_prices) - shared_wallet.balance
+    total += grid_engine.portfolio_value(prices) - shared_wallet.balance
+    return total
 
 
 @app.get("/api/portfolio/total")

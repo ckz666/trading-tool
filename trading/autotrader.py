@@ -2,7 +2,7 @@ import asyncio
 import concurrent.futures
 import pandas as pd
 from datetime import datetime, date
-from typing import Optional
+from typing import Callable, Optional
 
 from exchange.futures_client import FuturesClient
 from exchange.binance_data import fetch_ohlcv_binance, fetch_funding_rate_history_binance
@@ -64,11 +64,26 @@ class AutoTrader:
         # z-score of Bitget's cvd_ratio (ring-buffer-normalised, see _run_symbol) once
         # that validation has happened.
         use_cvd_feature: bool = False,
+        # Injected by web/app.py: returns the TRUE combined equity across every
+        # engine sharing the wallet (AutoTrader, Funding Harvest, Grid, Mean
+        # Reversion, Pairs Trading), not just this engine's own cash+positions.
+        # Without this, self.engine.portfolio_value() below is blind to capital
+        # the OTHER engines have locked in their own open positions — that capital
+        # is missing from shared_wallet.balance too (it's not "lost", it's just
+        # held elsewhere), so risk checks against the narrow view can read a
+        # portfolio as deeply underwater when it's actually fine (found live,
+        # 2026-07-23: Mean Reversion held $1,677 in an open position, invisible
+        # to AutoTrader's own view, which then saw a false 16% "daily loss" and
+        # blocked all new entries — see project memory). None keeps the old
+        # narrow (and now known-wrong-in-a-multi-engine-world) behaviour, for
+        # standalone use/testing without the rest of the app wired up.
+        portfolio_value_fn: Optional[Callable[[], float]] = None,
     ):
         self.symbols = list(symbols or DEFAULT_SYMBOLS)
         self.timeframe = timeframe
         self.interval = interval_seconds
         self.engine = engine or FuturesPaperEngine()
+        self.portfolio_value_fn = portfolio_value_fn
         self.risk = RiskManager(risk_config or RiskConfig(), state_file="data/autotrader_risk_state.json")
         if self.risk.peak_equity <= 0:
             # First-ever boot (no prior risk-state file): seed with the wallet's
@@ -371,20 +386,26 @@ class AutoTrader:
                     return
 
             # ── risk checks (daily loss + drawdown) ──
-            portfolio_value = self.engine.portfolio_value(self.live_prices | {symbol: price})
+            # Deliberately the TRUE cross-engine equity when available (see
+            # portfolio_value_fn docstring above) — a 5%/15% loss breaker should
+            # reflect the whole account, not just what AutoTrader itself is
+            # holding, or it can trip on money that's simply parked in another
+            # engine's position rather than actually lost.
+            risk_portfolio_value = (self.portfolio_value_fn() if self.portfolio_value_fn
+                                     else self.engine.portfolio_value(self.live_prices | {symbol: price}))
             open_count  = len(self.engine.positions)
             has_position = symbol in self.engine.positions
 
             if not has_position:   # only block NEW entries, not position management
-                if not self.risk.check_daily_loss(portfolio_value):
+                if not self.risk.check_daily_loss(risk_portfolio_value):
                     self._log("WARN", f"Blocked (daily loss): {self.risk.block_reason}", symbol)
                     return
-                if not self.risk.check_drawdown(portfolio_value):
+                if not self.risk.check_drawdown(risk_portfolio_value):
                     self._log("WARN", f"Blocked (drawdown): {self.risk.block_reason}", symbol)
                     return
             else:
                 # Still update peak equity tracking even when managing existing positions
-                self.risk.check_drawdown(portfolio_value)
+                self.risk.check_drawdown(risk_portfolio_value)
 
             # ── max positions check ──
             if open_count >= self.max_open_positions and not has_position:
