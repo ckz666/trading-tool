@@ -679,7 +679,10 @@ async def stop_mean_reversion():
 async def mean_reversion_status():
     prices = {sym: d["price"] for sym, d in _price_cache.items()}
     base = mean_reversion_harvester.status() if mean_reversion_harvester else {"running": False}
-    base["engine"] = mean_reversion_engine.status(prices)
+    engine_status = mean_reversion_engine.status(prices)
+    for sym, pos in engine_status.get("positions", {}).items():
+        pos["current_price"] = prices.get(sym)
+    base["engine"] = engine_status
     return base
 
 

@@ -308,6 +308,9 @@ button:disabled { opacity: 0.4; cursor: default; }
   <button class="nav-tab" onclick="showTab('grid', this)">
     <span class="tab-icon">▦</span>Grid
   </button>
+  <button class="nav-tab" onclick="showTab('meanrev', this)">
+    <span class="tab-icon">↔</span>Mean Rev
+  </button>
 </nav>
 
 <!-- ══════════════════════ DASHBOARD ══════════════════════ -->
@@ -332,6 +335,7 @@ button:disabled { opacity: 0.4; cursor: default; }
       <div class="stats" style="margin-bottom:0">
         <div class="stat"><div class="lbl">Funding Harvest</div><div class="val" id="pt-fh">—</div></div>
         <div class="stat"><div class="lbl">Grid Trading</div><div class="val" id="pt-grid">—</div></div>
+        <div class="stat"><div class="lbl">Mean Reversion</div><div class="val" id="pt-mr">—</div></div>
       </div>
     </div>
   </div>
@@ -772,6 +776,93 @@ button:disabled { opacity: 0.4; cursor: default; }
   </div>
 </div>
 
+<!-- ══════════════════════ MEAN REVERSION ══════════════════════ -->
+<div id="tab-meanrev" class="page">
+  <div class="grid2" style="margin-bottom:12px;">
+
+    <!-- Config -->
+    <div class="card">
+      <div class="card-title">Mean Reversion</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.5;">
+        Gegenstück zum Trend-Modell: kauft bei RSI-überverkauft nahe unterem Bollinger-Band, verkauft bei
+        überkauft nahe oberem Band — nur in echten Range-Regimen (ADX unter der Schwelle). Kein ML,
+        rein regelbasiert. SL ist bewusst weiter als TP (asymmetrisches Payoff: häufige kleine
+        Reversions-Gewinne, seltene größere Verluste bei Trendausbruch).
+      </div>
+      <div class="cfg-grid">
+        <div class="fg"><label>Scan-Intervall (Sek.)</label>
+          <input id="mr-interval" type="number" value="300" min="60"></div>
+        <div class="fg"><label>Leverage</label>
+          <input id="mr-leverage" type="number" value="3" min="1" max="10"></div>
+        <div class="fg"><label>ADX max (Range-Filter)</label>
+          <input id="mr-adx" type="number" value="20" min="5" max="40"></div>
+        <div class="fg"><label>RSI überverkauft/-kauft</label>
+          <input id="mr-rsi-os" type="number" value="32" min="1" max="49" style="width:60px;">
+          <input id="mr-rsi-ob" type="number" value="68" min="51" max="99" style="width:60px;"></div>
+        <div class="fg"><label>SL / TP (x ATR)</label>
+          <input id="mr-sl-mult" type="number" value="2.0" min="0.5" step="0.5" style="width:60px;">
+          <input id="mr-tp-mult" type="number" value="1.0" min="0.5" step="0.5" style="width:60px;"></div>
+        <div class="fg"><label>Risiko % / Trade</label>
+          <input id="mr-risk" type="number" value="0.5" min="0.1" step="0.1"></div>
+        <div class="fg"><label>Max % Kapital gesamt</label>
+          <input id="mr-maxmargin" type="number" value="20" min="5" max="100"></div>
+      </div>
+      <div class="fg" style="margin-bottom:12px;">
+        <label>Symbole (kommagetrennt)</label>
+        <input id="mr-symbols" type="text" value="BTC/USDT, ETH/USDT" style="width:100%">
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="primary" id="mr-start-btn" onclick="startMeanReversion()" style="flex:1">▶ Start</button>
+        <button class="danger"  id="mr-stop-btn"  onclick="stopMeanReversion()" style="flex:1" disabled>■ Stop</button>
+      </div>
+    </div>
+
+    <!-- Status -->
+    <div class="card">
+      <div class="card-title">Status</div>
+      <div class="stats" style="margin-bottom:12px;">
+        <div class="stat"><div class="lbl">Balance</div><div class="val" id="mr-balance">—</div></div>
+        <div class="stat"><div class="lbl">Portfolio</div><div class="val" id="mr-portfolio">—</div></div>
+        <div class="stat"><div class="lbl">PnL (live)</div><div class="val" id="mr-pnl">—</div></div>
+        <div class="stat"><div class="lbl">Trades</div><div class="val" id="mr-trades">—</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Positions -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">Offene Positionen (<span id="mr-pos-count">0</span>)</div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Seite</th><th>Entry</th><th>Aktuell</th>
+          <th>SL</th><th>TP</th><th>Netto P&L</th><th>ROE</th>
+        </tr></thead>
+        <tbody id="mr-positions-body"><tr class="empty-row"><td colspan="8">Keine offenen Positionen</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- History -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="card-title">Historie (<span id="mr-history-count">0</span>)</div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead><tr>
+          <th>Zeit</th><th>Symbol</th><th>Aktion</th><th>Entry</th><th>Exit</th><th>PnL</th><th>ROE</th><th>Grund</th>
+        </tr></thead>
+        <tbody id="mr-history-body"><tr class="empty-row"><td colspan="8">Keine Trades</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="card">
+    <div class="card-title">Log</div>
+    <div id="mr-log" class="log" style="max-height:260px;"></div>
+  </div>
+</div>
+
 <script>
 // ── WebSocket ──────────────────────────────────────────────────────────────
 const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -804,6 +895,9 @@ function showTab(name, btn) {
   }
   if (name === 'grid') {
     refreshGrid();
+  }
+  if (name === 'meanrev') {
+    refreshMeanReversion();
   }
 }
 
@@ -1599,6 +1693,7 @@ async function refreshPortfolioTotal() {
     if (pnlEl) { pnlEl.textContent = pnlStr(d.total_pnl, ' USDT'); pnlEl.style.color = pnlColor(d.total_pnl); }
     set('pt-fh',   '$' + fmt(d.funding_harvest_positions_value));
     set('pt-grid', '$' + fmt(d.grid_positions_value));
+    set('pt-mr',   '$' + fmt(d.mean_reversion_positions_value));
   } catch(e) { console.error('refreshPortfolioTotal:', e); }
 }
 
@@ -1737,6 +1832,131 @@ async function refreshFundingHarvest() {
     // again later (e.g. via the API directly, outside this browser tab).
     setTimeout(refreshFundingHarvest, s.running ? 8000 : 15000);
   } catch(e) { console.error('refreshFundingHarvest:', e); }
+}
+
+// ── Mean Reversion ─────────────────────────────────────────────────────────
+async function startMeanReversion() {
+  const symbols = document.getElementById('mr-symbols').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  const body = {
+    symbols,
+    interval_seconds: Number(document.getElementById('mr-interval').value),
+    leverage: Number(document.getElementById('mr-leverage').value),
+    adx_max: Number(document.getElementById('mr-adx').value),
+    rsi_oversold: Number(document.getElementById('mr-rsi-os').value),
+    rsi_overbought: Number(document.getElementById('mr-rsi-ob').value),
+    atr_sl_mult: Number(document.getElementById('mr-sl-mult').value),
+    atr_tp_mult: Number(document.getElementById('mr-tp-mult').value),
+    risk_pct: Number(document.getElementById('mr-risk').value) / 100,
+    max_total_margin_pct: Number(document.getElementById('mr-maxmargin').value) / 100,
+  };
+  try {
+    const r = await fetch('/api/mean-reversion/start', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    if (!r.ok) { const e = await r.json(); alert('Start fehlgeschlagen: ' + (e.detail || r.status)); return; }
+    document.getElementById('mr-start-btn').disabled = true;
+    document.getElementById('mr-start-btn').textContent = 'Läuft...';
+    document.getElementById('mr-stop-btn').disabled = false;
+    refreshMeanReversion();
+  } catch(e) { alert('Start fehlgeschlagen: ' + e); }
+}
+
+async function stopMeanReversion() {
+  try {
+    await fetch('/api/mean-reversion/stop', { method: 'POST' });
+    document.getElementById('mr-start-btn').disabled = false;
+    document.getElementById('mr-start-btn').textContent = '▶ Start';
+    document.getElementById('mr-stop-btn').disabled = true;
+  } catch(e) { alert('Stop fehlgeschlagen: ' + e); }
+}
+
+function renderMeanReversionPositions(positions) {
+  const tbody = document.getElementById('mr-positions-body');
+  const entries = Object.entries(positions || {});
+  document.getElementById('mr-pos-count').textContent = entries.length;
+  if (!entries.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Keine offenen Positionen</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  entries.forEach(([sym, p]) => {
+    const pnl = p.net_pnl ?? p.unrealized_pnl ?? 0;
+    const roe = p.net_roe_pct ?? p.roe_pct ?? 0;
+    const pc = pnlColor(pnl);
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td style="font-weight:700">${sym.replace('/USDT','')}</td>
+      <td style="color:${p.side==='long'?'var(--green)':'var(--red)'}">${p.side==='long'?'Long':'Short'}</td>
+      <td>$${fmt(p.entry_price)}</td>
+      <td>${p.current_price!=null ? '$'+fmt(p.current_price) : '—'}</td>
+      <td class="muted">$${fmt(p.stop_loss)}</td>
+      <td class="muted">$${fmt(p.take_profit)}</td>
+      <td style="color:${pc};font-weight:700">${pnlStr(pnl)}</td>
+      <td style="color:${pc}">${roe>=0?'+':''}${roe.toFixed(1)}%</td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+function renderMeanReversionHistory(trades) {
+  const tbody = document.getElementById('mr-history-body');
+  document.getElementById('mr-history-count').textContent = trades.length;
+  if (!trades.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Keine Trades</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  trades.forEach(t => {
+    const pc = t.pnl != null ? pnlColor(t.pnl) : 'var(--muted)';
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td class="muted">${fmtTime(t.ts)}</td>
+      <td style="font-weight:700">${(t.symbol||'—').replace('/USDT','')}</td>
+      <td>${(t.action||'—').replace('close_','').replace('_',' ')}</td>
+      <td>${t.entry_price!=null ? '$'+fmt(t.entry_price) : '—'}</td>
+      <td>${t.exit_price!=null ? '$'+fmt(t.exit_price) : '—'}</td>
+      <td style="color:${pc};font-weight:700">${t.pnl!=null ? pnlStr(t.pnl) : '—'}</td>
+      <td style="color:${pc}">${t.roe_pct!=null ? (t.roe_pct>=0?'+':'')+t.roe_pct.toFixed(1)+'%' : '—'}</td>
+      <td class="muted">${t.reason || '—'}</td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+async function refreshMeanReversion() {
+  try {
+    const s = await (await fetch('/api/mean-reversion/status')).json();
+    document.getElementById('mr-start-btn').disabled = !!s.running;
+    document.getElementById('mr-start-btn').textContent = s.running ? 'Läuft...' : '▶ Start';
+    document.getElementById('mr-stop-btn').disabled = !s.running;
+
+    const eng = s.engine || {};
+    document.getElementById('mr-balance').textContent = eng.balance != null ? '$' + fmt(eng.balance) : '—';
+    document.getElementById('mr-portfolio').textContent = eng.portfolio_value != null ? '$' + fmt(eng.portfolio_value) : '—';
+    const pnl = eng.total_pnl_live ?? eng.total_pnl ?? 0;
+    const pnlEl = document.getElementById('mr-pnl');
+    pnlEl.textContent = pnlStr(pnl, ' USDT');
+    pnlEl.style.color = pnlColor(pnl);
+    document.getElementById('mr-trades').textContent = eng.trade_count ?? '—';
+
+    renderMeanReversionPositions(eng.positions);
+
+    const history = await (await fetch('/api/mean-reversion/history?limit=50')).json();
+    renderMeanReversionHistory(history);
+
+    const log = await (await fetch('/api/mean-reversion/log?limit=50')).json();
+    const logEl = document.getElementById('mr-log');
+    logEl.innerHTML = '';
+    log.slice().reverse().forEach(entry => {
+      const line = document.createElement('div');
+      line.className = 'log-line ' + (entry.level || '');
+      const sym = entry.symbol && entry.symbol !== 'ALL' ? `[${entry.symbol.replace('/USDT','')}] ` : '';
+      line.textContent = `[${fmtTime(entry.ts)}] ${sym}${entry.msg}`;
+      logEl.appendChild(line);
+    });
+
+    setTimeout(refreshMeanReversion, s.running ? 8000 : 15000);
+  } catch(e) { console.error('refreshMeanReversion:', e); }
 }
 
 // ── Grid Trading ───────────────────────────────────────────────────────────
@@ -1890,6 +2110,15 @@ async function refreshGrid() {
     }
     refreshGrid();
   } catch(e) { console.warn('Grid init check failed:', e); }
+  try {
+    const ms = await (await fetch('/api/mean-reversion/status')).json();
+    if (ms.running) {
+      document.getElementById('mr-start-btn').textContent = 'Läuft...';
+      document.getElementById('mr-start-btn').disabled = true;
+      document.getElementById('mr-stop-btn').disabled = false;
+    }
+    refreshMeanReversion();
+  } catch(e) { console.warn('Mean reversion init check failed:', e); }
 })();
 </script>
 </body>
