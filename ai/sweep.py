@@ -29,7 +29,7 @@ import pandas as pd
 from ai.backtest import _resample_ohlcv, _atr, _confluence_score_bt
 from ai.ml_signal import (
     build_features, train as ml_train, get_indicators, detect_market_structure,
-    predict, _paths, _pattern_signal,
+    predict, _paths, _pattern_signal, cvd_zscore_from_ohlcv, taker_ratio_zscore_from_ohlcv,
 )
 from ai.patterns import detect_patterns
 from ai.vol_regime import classify_vol_regime, rolling_prob_storm
@@ -63,6 +63,13 @@ def compute_signal_table(
     atr_full = _atr(df_1h)
     pattern_signal_full = _pattern_signal(df_1h)
     prob_storm_full = rolling_prob_storm(df_1h)
+    # Same precompute-once optimisation as pattern_signal/prob_storm above —
+    # both are strictly causal with a fixed trailing lookback (rolling window
+    # =100), so a value at a given timestamp is identical whether computed on
+    # the full history or a window ending there (2026-07-23, order-flow
+    # feature activation round, see project memory).
+    cvd_full = cvd_zscore_from_ohlcv(df_1h)
+    taker_ratio_full = taker_ratio_zscore_from_ohlcv(df_1h)
 
     rows = []
     for i in range(len(df_test)):
@@ -85,6 +92,8 @@ def compute_signal_table(
                 window_1h, funding_series=fs_window,
                 precomputed_pattern_signal=pattern_signal_full,
                 precomputed_prob_storm=prob_storm_full,
+                precomputed_cvd_zscore=cvd_full,
+                precomputed_taker_ratio_zscore=taker_ratio_full,
             )
             sig = predict(window_1h, symbol, funding_series=fs_window, features=feats_1h)
         except Exception:

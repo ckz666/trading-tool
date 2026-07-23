@@ -75,6 +75,32 @@ def cvd_zscore_from_ohlcv(df: pd.DataFrame, window: int = 100) -> pd.Series:
     return ((cvd - roll_mean) / roll_std.replace(0, pd.NA)).fillna(0.0)
 
 
+def taker_ratio_zscore_from_ohlcv(df: pd.DataFrame, window: int = 100) -> pd.Series:
+    """
+    Second order-flow feature (2026-07-23, DeepSeek follow-up round, see
+    project memory), deliberately NOT the same signal as cvd_zscore despite
+    sharing a data source: this is a rolling z-score of the PER-BAR taker
+    buy ratio (buy_volume / total_volume, bounded [0,1], mean-reverting
+    around ~0.5) — an instantaneous pressure reading. cvd_zscore above is a
+    z-score of the CUMULATIVE running sum of buy-minus-sell volume — a
+    trend-following, unbounded quantity. Same underlying trade tape, two
+    structurally different signals (snapshot vs. accumulated drift).
+
+    On the LIVE side (trading/autotrader.py) this distinction only holds if
+    the ring buffers actually track different things — cvd_ratio_buffer was
+    fixed alongside this feature to accumulate cvd_net (true running delta)
+    instead of ring-buffering the raw ratio, specifically so this feature
+    and cvd_zscore stay non-redundant in production too, not just in
+    training. See _run_symbol's CVD/taker-ratio ring buffer comments.
+    """
+    if "taker_buy_volume" not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    ratio = df["taker_buy_volume"] / df["volume"].replace(0, pd.NA)
+    roll_mean = ratio.rolling(window).mean()
+    roll_std  = ratio.rolling(window).std()
+    return ((ratio - roll_mean) / roll_std.replace(0, pd.NA)).fillna(0.0)
+
+
 def _squeeze_indicators(df: pd.DataFrame, period: int = 20,
                          bb_mult: float = 2.0, kc_mult: float = 1.5) -> pd.DataFrame:
     """
@@ -170,7 +196,8 @@ def _pattern_signal(df: pd.DataFrame) -> pd.Series:
 def build_features(df: pd.DataFrame, funding_series: pd.Series = None,
                     precomputed_pattern_signal: pd.Series = None,
                     precomputed_prob_storm: pd.Series = None,
-                    precomputed_cvd_zscore: pd.Series = None) -> pd.DataFrame:
+                    precomputed_cvd_zscore: pd.Series = None,
+                    precomputed_taker_ratio_zscore: pd.Series = None) -> pd.DataFrame:
     """
     precomputed_pattern_signal / precomputed_prob_storm: optional, already-computed
     _pattern_signal()/rolling_prob_storm() results covering (at least) df's index range.
@@ -245,6 +272,13 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None,
     # (Binance-trained / Bitget-live source mismatch) and inert-by-default rationale.
     f["cvd_zscore"] = (precomputed_cvd_zscore.reindex(df.index).fillna(0.0)
                         if precomputed_cvd_zscore is not None else cvd_zscore_from_ohlcv(df))
+
+    # Second order-flow feature (1 feature, 2026-07-23): see
+    # taker_ratio_zscore_from_ohlcv() docstring for why this is deliberately
+    # not redundant with cvd_zscore above despite sharing a data source.
+    f["taker_ratio_zscore"] = (precomputed_taker_ratio_zscore.reindex(df.index).fillna(0.0)
+                                if precomputed_taker_ratio_zscore is not None
+                                else taker_ratio_zscore_from_ohlcv(df))
 
     # 4H context (4 features: resampled from this same 1h data, no extra fetch —
     # lets the model see whether the bigger-picture trend agrees with the 1h read).

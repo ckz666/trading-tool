@@ -17,6 +17,7 @@ from typing import Optional
 from ai.ml_signal import (
     build_features, make_labels, train as ml_train,
     get_indicators, detect_market_structure, _funding_to_series, _pattern_signal,
+    cvd_zscore_from_ohlcv, taker_ratio_zscore_from_ohlcv,
 )
 from ai.patterns import detect_patterns
 from ai.vol_regime import classify_vol_regime, rolling_prob_storm
@@ -195,6 +196,8 @@ def run_backtest(
     _progress("Pre-compute Pattern-Signal & Vol-Regime über volle Historie…")
     pattern_signal_full = _pattern_signal(df_1h)
     prob_storm_full      = rolling_prob_storm(df_1h)
+    cvd_full             = cvd_zscore_from_ohlcv(df_1h)
+    taker_ratio_full     = taker_ratio_zscore_from_ohlcv(df_1h)
 
     # ── Walk-forward through test bars ───────────────────────────────────────
     trades = []
@@ -287,6 +290,8 @@ def run_backtest(
                 window_1h, funding_series=fs_window,
                 precomputed_pattern_signal=pattern_signal_full,
                 precomputed_prob_storm=prob_storm_full,
+                precomputed_cvd_zscore=cvd_full,
+                precomputed_taker_ratio_zscore=taker_ratio_full,
             )
         except Exception:
             continue
