@@ -17,6 +17,7 @@ from trading.backtest import run_backtest
 from ai.backtest import run_backtest as run_mtf_backtest
 from trading.autotrader import AutoTrader
 from trading.funding_harvest import FundingHarvestEngine, FundingHarvester
+from trading.mean_reversion import MeanReversionHarvester, MR_STATE_FILE
 from trading.grid import GridEngine, GridTrader
 from trading.wallet import SharedWallet
 from trading.risk import RiskConfig
@@ -42,6 +43,9 @@ _funding_harvester_starting = False
 grid_engine = GridEngine(wallet=shared_wallet)
 grid_trader: GridTrader = None
 _grid_trader_starting = False
+mean_reversion_engine = FuturesPaperEngine(wallet=shared_wallet, state_file=MR_STATE_FILE)
+mean_reversion_harvester: MeanReversionHarvester = None
+_mean_reversion_starting = False
 _price_cache: dict[str, dict] = {}
 _ws_clients: list[WebSocket] = []
 
@@ -82,6 +86,10 @@ async def _price_poll_loop():
                     for sym in grid_trader.symbols:
                         if sym not in WATCH_SYMBOLS:
                             WATCH_SYMBOLS.append(sym)
+                if mean_reversion_harvester:
+                    for sym in mean_reversion_harvester.symbols:
+                        if sym not in WATCH_SYMBOLS:
+                            WATCH_SYMBOLS.append(sym)
 
                 for sym in list(WATCH_SYMBOLS):
                     try:
@@ -104,6 +112,8 @@ async def _price_poll_loop():
                         autotrader.live_prices[sym] = price
                     if grid_trader:
                         grid_trader.live_prices[sym] = price
+                    if mean_reversion_harvester:
+                        mean_reversion_harvester.live_prices[sym] = price
 
                 await _broadcast({"type": "prices", "data": list(_price_cache.values())})
                 # equity snapshot every cycle (works with or without AutoTrader)
@@ -613,6 +623,78 @@ def funding_harvest_log(limit: int = 50):
     return funding_harvester.log[-limit:]
 
 
+# ── Mean Reversion (range trading, counterpart to AutoTrader's trend model — see project memory) ──
+class MeanReversionStartRequest(BaseModel):
+    symbols: list[str] = ["BTC/USDT", "ETH/USDT"]
+    interval_seconds: int = 300
+    adx_max: float = 20.0
+    rsi_oversold: float = 32.0
+    rsi_overbought: float = 68.0
+    bb_pct_low: float = 0.15
+    bb_pct_high: float = 0.85
+    atr_sl_mult: float = 2.0
+    atr_tp_mult: float = 1.0
+    risk_pct: float = 0.005
+    leverage: int = 3
+    max_total_margin_pct: float = 0.20
+
+
+@app.post("/api/mean-reversion/start")
+async def start_mean_reversion(req: MeanReversionStartRequest):
+    global mean_reversion_harvester, _mean_reversion_starting
+    if _mean_reversion_starting or (mean_reversion_harvester and mean_reversion_harvester.running):
+        raise HTTPException(400, "MeanReversionHarvester already running")
+    _mean_reversion_starting = True
+    try:
+        mean_reversion_harvester = MeanReversionHarvester(
+            symbols=req.symbols,
+            engine=mean_reversion_engine,
+            interval_seconds=req.interval_seconds,
+            adx_max=req.adx_max,
+            rsi_oversold=req.rsi_oversold,
+            rsi_overbought=req.rsi_overbought,
+            bb_pct_low=req.bb_pct_low,
+            bb_pct_high=req.bb_pct_high,
+            atr_sl_mult=req.atr_sl_mult,
+            atr_tp_mult=req.atr_tp_mult,
+            risk_pct=req.risk_pct,
+            leverage=req.leverage,
+            max_total_margin_pct=req.max_total_margin_pct,
+        )
+        mean_reversion_harvester.start()
+        return {"status": "started"}
+    finally:
+        _mean_reversion_starting = False
+
+
+@app.post("/api/mean-reversion/stop")
+async def stop_mean_reversion():
+    if not mean_reversion_harvester or not mean_reversion_harvester.running:
+        raise HTTPException(400, "MeanReversionHarvester not running")
+    await mean_reversion_harvester.stop()
+    return {"status": "stopped"}
+
+
+@app.get("/api/mean-reversion/status")
+async def mean_reversion_status():
+    prices = {sym: d["price"] for sym, d in _price_cache.items()}
+    base = mean_reversion_harvester.status() if mean_reversion_harvester else {"running": False}
+    base["engine"] = mean_reversion_engine.status(prices)
+    return base
+
+
+@app.get("/api/mean-reversion/history")
+def mean_reversion_history(limit: int = 50):
+    return list(reversed(mean_reversion_engine.trade_history[-limit:]))
+
+
+@app.get("/api/mean-reversion/log")
+def mean_reversion_log(limit: int = 50):
+    if not mean_reversion_harvester:
+        return []
+    return mean_reversion_harvester.get_log(limit)
+
+
 # ── Grid Trading (structural range-oscillation edge, separate from everything else) ──
 class GridStartRequest(BaseModel):
     symbols: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
@@ -751,13 +833,19 @@ async def portfolio_total():
     grid_value = grid_engine.portfolio_value(grid_prices)
     grid_positions_value = grid_value - shared_wallet.balance
 
-    total = shared_wallet.balance + futures_positions_value + harvest_positions_value + grid_positions_value
+    mr_prices = {sym: d["price"] for sym, d in _price_cache.items()}
+    mr_value = mean_reversion_engine.portfolio_value(mr_prices)
+    mr_positions_value = mr_value - shared_wallet.balance
+
+    total = (shared_wallet.balance + futures_positions_value + harvest_positions_value
+             + grid_positions_value + mr_positions_value)
     return {
         "shared_balance": round(shared_wallet.balance, 2),
         "initial_balance": shared_wallet.initial_balance,
         "autotrader_positions_value": round(futures_positions_value, 2),
         "funding_harvest_positions_value": round(harvest_positions_value, 2),
         "grid_positions_value": round(grid_positions_value, 2),
+        "mean_reversion_positions_value": round(mr_positions_value, 2),
         "total_portfolio_value": round(total, 2),
         "total_pnl": round(total - shared_wallet.initial_balance, 2),
     }

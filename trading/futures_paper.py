@@ -116,7 +116,13 @@ def calc_liquidation_price(entry: float, side: str, leverage: int) -> float:
 
 
 class FuturesPaperEngine:
-    def __init__(self, wallet: SharedWallet = None, initial_balance: float = 10000.0):
+    def __init__(self, wallet: SharedWallet = None, initial_balance: float = 10000.0,
+                 state_file: str = STATE_FILE):
+        # state_file: lets a second, independent strategy (e.g. Mean Reversion) reuse
+        # this same tested engine (position mgmt, SL/TP, fee accounting) on the same
+        # shared wallet without colliding with AutoTrader's own state file — same
+        # pattern FundingHarvestEngine/GridEngine already use for their own state.
+        self.state_file = state_file
         self.wallet = wallet or SharedWallet(initial_balance)
         self.positions: dict[str, FuturesPosition] = {}
         self.trade_history: list[dict] = []
@@ -129,7 +135,7 @@ class FuturesPaperEngine:
     # persists this engine's own positions/history.
 
     def _save(self):
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
         state = {
             "total_pnl": self.total_pnl,
             "trade_history": self.trade_history,
@@ -139,17 +145,17 @@ class FuturesPaperEngine:
             },
             "saved_at": datetime.now().isoformat(),
         }
-        tmp = STATE_FILE + ".tmp"
+        tmp = self.state_file + ".tmp"
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
-        os.replace(tmp, STATE_FILE)   # atomic write
+        os.replace(tmp, self.state_file)   # atomic write
         self.wallet._save()
 
     def _load(self):
-        if not os.path.exists(STATE_FILE):
+        if not os.path.exists(self.state_file):
             return
         try:
-            with open(STATE_FILE) as f:
+            with open(self.state_file) as f:
                 state = json.load(f)
             self.total_pnl       = state.get("total_pnl", 0.0)
             self.trade_history   = state.get("trade_history", [])
@@ -174,7 +180,7 @@ class FuturesPaperEngine:
                     partial_closed   = d.get("partial_closed", False),
                     mode             = d.get("mode", "trend"),
                 )
-            print(f"[FuturesPaper] Loaded state: wallet balance={self.wallet.balance:.2f} USDT, "
+            print(f"[FuturesPaper:{self.state_file}] Loaded state: wallet balance={self.wallet.balance:.2f} USDT, "
                   f"{len(self.positions)} open pos, {len(self.trade_history)} trades")
         except Exception as e:
             print(f"[FuturesPaper] Could not load state: {e} — starting fresh")
@@ -186,8 +192,8 @@ class FuturesPaperEngine:
         self.trade_history = []
         self.total_pnl = 0.0
         self.equity_history = []
-        if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)
+        if os.path.exists(self.state_file):
+            os.remove(self.state_file)
 
     # ── Trading ───────────────────────────────────────────────────────────────
 

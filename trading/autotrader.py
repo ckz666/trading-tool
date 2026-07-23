@@ -69,7 +69,13 @@ class AutoTrader:
         self.timeframe = timeframe
         self.interval = interval_seconds
         self.engine = engine or FuturesPaperEngine()
-        self.risk = RiskManager(risk_config or RiskConfig())
+        self.risk = RiskManager(risk_config or RiskConfig(), state_file="data/autotrader_risk_state.json")
+        if self.risk.peak_equity <= 0:
+            # First-ever boot (no prior risk-state file): seed with the wallet's
+            # starting balance instead of 0, so the drawdown breaker reflects the
+            # true since-inception drawdown immediately rather than "discovering"
+            # a fake new peak at whatever the equity happens to be right now.
+            self.risk.peak_equity = self.engine.wallet.initial_balance
         self.max_leverage = max_leverage
         self.max_open_positions = max_open_positions
         self.max_same_direction = max_same_direction

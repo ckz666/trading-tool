@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, date
+import json
+import os
 
 
 @dataclass
@@ -24,7 +26,13 @@ class OpenPosition:
 
 
 class RiskManager:
-    def __init__(self, config: RiskConfig = None):
+    def __init__(self, config: RiskConfig = None, state_file: str = None):
+        # state_file: persists peak_equity/daily_pnl across restarts (audit finding
+        # 2026-07-23, see project memory — the drawdown breaker was silently losing
+        # its real peak on every service restart, measuring drawdown only from
+        # whatever equity happened to be at boot instead of the true all-time high).
+        # None (default) keeps the old ephemeral behaviour — used by ai/backtest.py
+        # and ai/sweep.py, which deliberately want a fresh RiskManager per run.
         self.config = config or RiskConfig()
         self.positions: dict[str, OpenPosition] = {}
         self.daily_pnl: float = 0.0
@@ -32,6 +40,39 @@ class RiskManager:
         self.blocked: bool = False
         self.block_reason: str = ""
         self.peak_equity: float = 0.0   # highest portfolio value ever seen
+        self.state_file = state_file
+        self._load_state()
+
+    def _load_state(self):
+        if not self.state_file or not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file) as f:
+                state = json.load(f)
+            self.peak_equity = state.get("peak_equity", 0.0)
+            self.daily_pnl = state.get("daily_pnl", 0.0)
+            saved_day = state.get("day")
+            if saved_day:
+                self._day = date.fromisoformat(saved_day)
+            print(f"[RiskManager:{self.state_file}] Loaded state: peak_equity=${self.peak_equity:,.2f}")
+        except Exception as e:
+            print(f"[RiskManager:{self.state_file}] Could not load state: {e} — starting fresh")
+
+    def _save_state(self):
+        if not self.state_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "peak_equity": self.peak_equity,
+                    "daily_pnl": self.daily_pnl,
+                    "day": self._day.isoformat(),
+                }, f, indent=2)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            print(f"[RiskManager:{self.state_file}] Could not save state: {e}")
 
     def _reset_daily_if_needed(self):
         today = date.today()
@@ -54,7 +95,9 @@ class RiskManager:
                     f"Drawdown-Breaker: {drawdown:.1%} unter Peak "
                     f"(Peak ${self.peak_equity:,.0f} → aktuell ${portfolio_value:,.0f})"
                 )
+                self._save_state()
                 return False
+        self._save_state()
         return True
 
     def check_daily_loss(self, portfolio_value: float) -> bool:
