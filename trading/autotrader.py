@@ -619,10 +619,17 @@ class AutoTrader:
 
             if action == "open_long" and not cur_pos:
                 self.position_stale_cycles[symbol] = 0
+                # Real per-symbol maintenance margin rate instead of a fixed 0.5%
+                # guess for every symbol (audit finding H-01, 2026-07-23, see
+                # project memory) — matters most for this bot's thinly-traded
+                # small-cap symbols, which can have meaningfully different tiers
+                # than BTC/ETH. Cached 1h, falls back to the old default on failure.
+                mmr = await client.fetch_maintenance_margin_rate(symbol, notional=amount * price)
                 record = self.engine.open_position(
                     symbol, "long", amount, price, leverage,
                     price * (1 - sl_pct), price * (1 + tp_pct),
-                    trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode)
+                    trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode,
+                    maintenance_margin=mmr)
                 regime_tag = f" | {vol_regime['regime'].upper()}" if vol_regime["regime"] == "storm" else ""
                 self._log("TRADE",
                     f"OPEN {mode_tag}LONG {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag} | Liq ${record['liq_price']:,.0f}",
@@ -630,10 +637,12 @@ class AutoTrader:
 
             elif action == "open_short" and not cur_pos:
                 self.position_stale_cycles[symbol] = 0
+                mmr = await client.fetch_maintenance_margin_rate(symbol, notional=amount * price)
                 record = self.engine.open_position(
                     symbol, "short", amount, price, leverage,
                     price * (1 + sl_pct), price * (1 - tp_pct),
-                    trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode)
+                    trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode,
+                    maintenance_margin=mmr)
                 regime_tag = f" | {vol_regime['regime'].upper()}" if vol_regime["regime"] == "storm" else ""
                 self._log("TRADE",
                     f"OPEN {mode_tag}SHORT {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag} | Liq ${record['liq_price']:,.0f}",

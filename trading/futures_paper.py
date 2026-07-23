@@ -108,11 +108,20 @@ class FuturesPosition:
         }
 
 
-def calc_liquidation_price(entry: float, side: str, leverage: int) -> float:
+def calc_liquidation_price(entry: float, side: str, leverage: int,
+                            maintenance_margin: float = MAINTENANCE_MARGIN) -> float:
+    """Still a simplified isolated-margin approximation (ignores mark-price vs.
+    last-price, fees, funding, cross-margin effects — audit finding H-01, 2026-07-23,
+    see project memory), but maintenance_margin can now be the real per-symbol tier
+    rate (exchange.futures_client.py::fetch_maintenance_margin_rate) instead of
+    always the same guessed constant — that was the larger source of error for
+    this bot's mixed BTC/altcoin symbol universe, tier-by-position-size barely
+    matters at these position sizes (checked against real Bitget tier data: this
+    bot's positions never leave tier 1 for any symbol)."""
     if side == "long":
-        return entry * (1 - 1 / leverage + MAINTENANCE_MARGIN)
+        return entry * (1 - 1 / leverage + maintenance_margin)
     else:
-        return entry * (1 + 1 / leverage - MAINTENANCE_MARGIN)
+        return entry * (1 + 1 / leverage - maintenance_margin)
 
 
 class FuturesPaperEngine:
@@ -209,7 +218,11 @@ class FuturesPaperEngine:
         trailing_sl: bool = False,
         trail_pct: float = 0.02,
         mode: str = "trend",
+        maintenance_margin: float = MAINTENANCE_MARGIN,
     ) -> dict:
+        """maintenance_margin: real per-symbol tier rate if the caller fetched one
+        (exchange.futures_client.py::fetch_maintenance_margin_rate), else the old
+        fixed default — see calc_liquidation_price docstring."""
         if symbol in self.positions:
             raise ValueError(f"Position already open for {symbol}. Close first.")
 
@@ -220,7 +233,7 @@ class FuturesPaperEngine:
         if self.wallet.balance < margin + fee:
             raise ValueError(f"Insufficient margin: need {margin+fee:.2f} USDT, have {self.wallet.balance:.2f}")
 
-        liq_price = calc_liquidation_price(price, side, leverage)
+        liq_price = calc_liquidation_price(price, side, leverage, maintenance_margin)
         self.wallet.balance -= (margin + fee)
         # Entry fee is a real, immediate cost (already deducted from wallet.balance
         # above) but close_position()/partial_close_position() only ever net the EXIT

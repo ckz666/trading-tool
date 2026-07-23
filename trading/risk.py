@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
-from datetime import datetime, date
+from dataclasses import dataclass
+from datetime import date
 import json
 import os
 
@@ -14,17 +14,6 @@ class RiskConfig:
     min_confidence: float = 0.55        # ML confidence threshold
 
 
-@dataclass
-class OpenPosition:
-    symbol: str
-    amount: float
-    entry_price: float
-    stop_loss: float
-    take_profit: float
-    opened_at: str = field(default_factory=lambda: datetime.now().isoformat())
-    unrealized_pnl: float = 0.0
-
-
 class RiskManager:
     def __init__(self, config: RiskConfig = None, state_file: str = None):
         # state_file: persists peak_equity/daily_pnl across restarts (audit finding
@@ -33,9 +22,20 @@ class RiskManager:
         # whatever equity happened to be at boot instead of the true all-time high).
         # None (default) keeps the old ephemeral behaviour — used by ai/backtest.py
         # and ai/sweep.py, which deliberately want a fresh RiskManager per run.
+        #
+        # This class used to also track its own OpenPosition objects and expose
+        # open_position()/check_sl_tp()/close_position()/update_position_pnl(),
+        # but those had a long-only PnL bug (no `side` field — always computed
+        # (exit-entry)*amount, wrong sign for shorts) AND were never actually
+        # called anywhere (grep-verified, audit finding H-02, 2026-07-23, see
+        # project memory) — real position tracking has lived in
+        # trading/futures_paper.py::FuturesPaperEngine (correctly long/short-aware)
+        # since before this file's methods were last touched. Removed rather than
+        # fixed, since keeping a parallel, unused, wrong implementation around
+        # only risks someone reaching for it later.
         self.config = config or RiskConfig()
-        self.positions: dict[str, OpenPosition] = {}
-        self.daily_pnl: float = 0.0
+        self.daily_pnl: float = 0.0   # realised-only, kept for display — NOT used for the loss check anymore, see check_daily_loss
+        self.day_start_equity: float = 0.0   # true portfolio value at the start of today, includes unrealised
         self._day: date = date.today()
         self.blocked: bool = False
         self.block_reason: str = ""
@@ -51,10 +51,12 @@ class RiskManager:
                 state = json.load(f)
             self.peak_equity = state.get("peak_equity", 0.0)
             self.daily_pnl = state.get("daily_pnl", 0.0)
+            self.day_start_equity = state.get("day_start_equity", 0.0)
             saved_day = state.get("day")
             if saved_day:
                 self._day = date.fromisoformat(saved_day)
-            print(f"[RiskManager:{self.state_file}] Loaded state: peak_equity=${self.peak_equity:,.2f}")
+            print(f"[RiskManager:{self.state_file}] Loaded state: peak_equity=${self.peak_equity:,.2f} "
+                  f"day_start_equity=${self.day_start_equity:,.2f}")
         except Exception as e:
             print(f"[RiskManager:{self.state_file}] Could not load state: {e} — starting fresh")
 
@@ -68,19 +70,22 @@ class RiskManager:
                 json.dump({
                     "peak_equity": self.peak_equity,
                     "daily_pnl": self.daily_pnl,
+                    "day_start_equity": self.day_start_equity,
                     "day": self._day.isoformat(),
                 }, f, indent=2)
             os.replace(tmp, self.state_file)
         except Exception as e:
             print(f"[RiskManager:{self.state_file}] Could not save state: {e}")
 
-    def _reset_daily_if_needed(self):
+    def _reset_daily_if_needed(self, portfolio_value: float = None):
         today = date.today()
         if today != self._day:
             self.daily_pnl = 0.0
             self._day = today
             self.blocked = False
             self.block_reason = ""
+            if portfolio_value is not None:
+                self.day_start_equity = portfolio_value
 
     def check_drawdown(self, portfolio_value: float) -> bool:
         """Returns False (block new entries) if equity dropped >max_drawdown_pct from peak.
@@ -101,13 +106,27 @@ class RiskManager:
         return True
 
     def check_daily_loss(self, portfolio_value: float) -> bool:
-        self._reset_daily_if_needed()
-        if self.daily_pnl < 0:
-            loss_pct = abs(self.daily_pnl) / portfolio_value
+        """Computed from a true equity time series (day-start portfolio value vs.
+        now — includes unrealised PnL) rather than only summing realised trade
+        closes (audit finding H-03, 2026-07-23, see project memory). The old
+        daily_pnl-only check couldn't see a large loss on a position that was
+        still open — it only reacted once that position actually closed, by
+        which point the loss had already happened. day_start_equity is seeded
+        on the first-ever call and re-seeded at each day rollover."""
+        if self.day_start_equity <= 0:
+            self.day_start_equity = portfolio_value
+        self._reset_daily_if_needed(portfolio_value)
+        if self.day_start_equity > 0:
+            loss_pct = (self.day_start_equity - portfolio_value) / self.day_start_equity
             if loss_pct >= self.config.max_daily_loss_pct:
                 self.blocked = True
-                self.block_reason = f"Daily loss limit reached: {loss_pct*100:.1f}%"
+                self.block_reason = (
+                    f"Daily loss limit reached: {loss_pct*100:.1f}% "
+                    f"(Tagesstart ${self.day_start_equity:,.0f} → aktuell ${portfolio_value:,.0f})"
+                )
+                self._save_state()
                 return False
+        self._save_state()
         return True
 
     def max_order_usdt(self, portfolio_value: float) -> float:
@@ -144,72 +163,12 @@ class RiskManager:
             return None
         return max(floor_pct, min(kelly * fraction, cap_pct))
 
-    def calc_stop_loss(self, price: float, side: str, stop_pct: float) -> float:
-        if side == "buy":
-            return price * (1 - stop_pct)
-        return price * (1 + stop_pct)
-
-    def calc_take_profit(self, price: float, side: str, tp_pct: float) -> float:
-        if side == "buy":
-            return price * (1 + tp_pct)
-        return price * (1 - tp_pct)
-
-    def open_position(self, symbol: str, amount: float, price: float,
-                       stop_loss: float, take_profit: float) -> OpenPosition:
-        pos = OpenPosition(
-            symbol=symbol,
-            amount=amount,
-            entry_price=price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-        )
-        self.positions[symbol] = pos
-        return pos
-
-    def update_position_pnl(self, symbol: str, current_price: float):
-        if symbol in self.positions:
-            pos = self.positions[symbol]
-            pos.unrealized_pnl = (current_price - pos.entry_price) * pos.amount
-
-    def check_sl_tp(self, symbol: str, current_price: float) -> str | None:
-        """Returns 'stop_loss' or 'take_profit' if triggered, else None."""
-        pos = self.positions.get(symbol)
-        if not pos:
-            return None
-        if current_price <= pos.stop_loss:
-            return "stop_loss"
-        if current_price >= pos.take_profit:
-            return "take_profit"
-        return None
-
-    def close_position(self, symbol: str, exit_price: float) -> float:
-        pos = self.positions.pop(symbol, None)
-        if not pos:
-            return 0.0
-        pnl = (exit_price - pos.entry_price) * pos.amount
-        self.daily_pnl += pnl
-        return pnl
-
-    def get_position(self, symbol: str) -> dict:
-        pos = self.positions.get(symbol)
-        if not pos:
-            return {"amount": 0, "entry_price": 0, "unrealized_pnl": 0}
-        return {
-            "amount": pos.amount,
-            "entry_price": pos.entry_price,
-            "stop_loss": pos.stop_loss,
-            "take_profit": pos.take_profit,
-            "unrealized_pnl": pos.unrealized_pnl,
-            "opened_at": pos.opened_at,
-        }
-
     def status(self) -> dict:
-        drawdown = (self.peak_equity - 0) / self.peak_equity if self.peak_equity > 0 else 0
         return {
             "blocked": self.blocked,
             "block_reason": self.block_reason,
             "daily_pnl": round(self.daily_pnl, 2),
-            "open_positions": len(self.positions),
+            "day_start_equity": round(self.day_start_equity, 2),
             "peak_equity": round(self.peak_equity, 2),
             "max_drawdown_pct": self.config.max_drawdown_pct,
             "max_position_pct": self.config.max_position_pct,

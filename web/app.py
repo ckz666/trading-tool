@@ -892,10 +892,27 @@ def grid_log(limit: int = 50):
 async def portfolio_total():
     """The true combined total across the shared wallet — the individual
     engines' own portfolio_value() only adds back their own positions, so
-    summing those directly would double-count the shared balance."""
+    summing those directly would double-count the shared balance.
+
+    A position whose price fetch fails is silently excluded from
+    portfolio_value() (it just isn't in the prices dict), which used to make
+    total_portfolio_value quietly look lower than reality with no signal that
+    anything was wrong (audit finding H-06, 2026-07-23, see project memory).
+    missing_symbols/valuation_status below make that visible instead."""
+    missing_symbols: set[str] = set()
+
+    def _engine_contribution(engine, prices: dict, open_symbols) -> float:
+        """This engine's own positions' value on top of the shared cash balance
+        (see the docstring above for why we can't just sum each engine's own
+        portfolio_value() directly), plus tracking which open positions had no
+        price available this round (audit finding H-06)."""
+        for sym in open_symbols:
+            if sym not in prices:
+                missing_symbols.add(sym)
+        return engine.portfolio_value(prices) - shared_wallet.balance
+
     futures_prices = {sym: d["price"] for sym, d in _price_cache.items()}
-    futures_value = futures_paper.portfolio_value(futures_prices)
-    futures_positions_value = futures_value - shared_wallet.balance
+    futures_positions_value = _engine_contribution(futures_paper, futures_prices, futures_paper.positions.keys())
 
     harvest_prices = {}
     if funding_harvest_engine.positions:
@@ -906,8 +923,7 @@ async def portfolio_total():
                     harvest_prices[sym] = {"spot": s["last"], "perp": p["last"]}
                 except Exception:
                     continue
-    harvest_value = funding_harvest_engine.portfolio_value(harvest_prices)
-    harvest_positions_value = harvest_value - shared_wallet.balance
+    harvest_positions_value = _engine_contribution(funding_harvest_engine, harvest_prices, funding_harvest_engine.positions.keys())
 
     grid_prices = {}
     if grid_engine.grids:
@@ -918,16 +934,13 @@ async def portfolio_total():
                     grid_prices[sym] = t["last"]
                 except Exception:
                     continue
-    grid_value = grid_engine.portfolio_value(grid_prices)
-    grid_positions_value = grid_value - shared_wallet.balance
+    grid_positions_value = _engine_contribution(grid_engine, grid_prices, grid_engine.grids.keys())
 
     mr_prices = {sym: d["price"] for sym, d in _price_cache.items()}
-    mr_value = mean_reversion_engine.portfolio_value(mr_prices)
-    mr_positions_value = mr_value - shared_wallet.balance
+    mr_positions_value = _engine_contribution(mean_reversion_engine, mr_prices, mean_reversion_engine.positions.keys())
 
     pairs_prices = {sym: d["price"] for sym, d in _price_cache.items()}
-    pairs_value = pairs_trading_engine.portfolio_value(pairs_prices)
-    pairs_positions_value = pairs_value - shared_wallet.balance
+    pairs_positions_value = _engine_contribution(pairs_trading_engine, pairs_prices, pairs_trading_engine.positions.keys())
 
     total = (shared_wallet.balance + futures_positions_value + harvest_positions_value
              + grid_positions_value + mr_positions_value + pairs_positions_value)
@@ -941,6 +954,8 @@ async def portfolio_total():
         "pairs_trading_positions_value": round(pairs_positions_value, 2),
         "total_portfolio_value": round(total, 2),
         "total_pnl": round(total - shared_wallet.initial_balance, 2),
+        "valuation_status": "incomplete" if missing_symbols else "complete",
+        "missing_symbols": sorted(missing_symbols),
     }
 
 

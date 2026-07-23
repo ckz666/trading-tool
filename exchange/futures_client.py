@@ -1,3 +1,4 @@
+import time
 import aiohttp
 import ccxt.async_support as ccxt
 import config
@@ -13,6 +14,15 @@ def to_futures_symbol(symbol: str) -> str:
     if symbol.endswith("/USDT") and ":USDT" not in symbol:
         return symbol + ":USDT"
     return symbol
+
+# Real per-symbol maintenance margin rate cache (audit finding H-01, 2026-07-23,
+# see project memory) — the paper engine's liquidation price used a single fixed
+# 0.5% MMR for every symbol, but real tiers vary a lot (BTC tier-1 is 0.4%, thin
+# altcoins are often meaningfully higher). Module-level so every FuturesClient
+# instance shares it (each engine cycle creates a fresh client). TTL keeps it
+# from calling the tiers endpoint on every single position open once warm.
+_MMR_CACHE: dict[str, tuple[float, float]] = {}   # symbol -> (rate, cached_at)
+_MMR_CACHE_TTL = 3600.0   # tiers change rarely, 1h is plenty
 
 
 class FuturesClient:
@@ -178,6 +188,32 @@ class FuturesClient:
             except Exception:
                 pass
         return result
+
+    async def fetch_maintenance_margin_rate(self, symbol: str, notional: float = 0.0) -> float:
+        """Real per-symbol maintenance margin rate from Bitget's tier table (see
+        module-level cache docstring for why this replaced a fixed 0.5% guess).
+        Falls back to 0.005 (the old hardcoded default) if the tiers fetch fails
+        or the symbol has no tier data — same value, just now sourced from real
+        data when available instead of always being a guess."""
+        now = time.monotonic()
+        cached = _MMR_CACHE.get(symbol)
+        if cached and now - cached[1] < _MMR_CACHE_TTL:
+            return cached[0]
+        try:
+            tiers = await self._exchange.fetch_market_leverage_tiers(to_futures_symbol(symbol))
+            rate = 0.005
+            for t in tiers:
+                min_n, max_n = t.get("minNotional", 0.0), t.get("maxNotional")
+                if notional >= min_n and (max_n is None or notional < max_n):
+                    rate = t.get("maintenanceMarginRate", 0.005)
+                    break
+            else:
+                if tiers:
+                    rate = tiers[0].get("maintenanceMarginRate", 0.005)   # smallest tier as fallback
+            _MMR_CACHE[symbol] = (rate, now)
+            return rate
+        except Exception:
+            return 0.005
 
     async def set_leverage(self, symbol: str, leverage: int):
         await self._exchange.set_leverage(leverage, to_futures_symbol(symbol))
