@@ -51,7 +51,12 @@ class FuturesClient:
     async def fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
         return await self._exchange.fetch_order_book(to_futures_symbol(symbol), limit)
 
-    async def fetch_funding_rate(self, symbol: str) -> dict:
+    async def fetch_funding_rate(self, symbol: str) -> dict | None:
+        """Returns None on failure — NOT a fake neutral rate. A prior version
+        returned {"rate": 0.0001} on error, which is indistinguishable from a
+        real (if small) reading and let strategies trade on it silently (audit
+        finding H-05, 2026-07-23, see project memory). Callers must check for
+        None and skip the symbol/cycle rather than treat a failed fetch as data."""
         try:
             fr = await self._exchange.fetch_funding_rate(to_futures_symbol(symbol))
             return {
@@ -59,14 +64,15 @@ class FuturesClient:
                 "next_ts": fr.get("nextFundingDatetime", ""),
             }
         except Exception:
-            return {"rate": 0.0001, "next_ts": ""}
+            return None
 
-    async def fetch_open_interest(self, symbol: str) -> dict:
+    async def fetch_open_interest(self, symbol: str) -> dict | None:
+        """Returns None on failure — see fetch_funding_rate docstring, same fix."""
         try:
             oi = await self._exchange.fetch_open_interest(to_futures_symbol(symbol))
             return {"open_interest": oi.get("openInterest", 0)}
         except Exception:
-            return {"open_interest": 0}
+            return None
 
     async def fetch_funding_rate_history(self, symbol: str, limit: int = 100) -> list:
         try:
@@ -74,8 +80,10 @@ class FuturesClient:
         except Exception:
             return []
 
-    async def fetch_current_oi(self, symbol: str) -> float:
-        """Fetch current Open Interest (base currency). Returns 0.0 on failure."""
+    async def fetch_current_oi(self, symbol: str) -> float | None:
+        """Fetch current Open Interest (base currency). Returns None on failure
+        or missing data — was 0.0 (a real-looking reading, not a "no data"
+        signal), see fetch_funding_rate docstring for why that's unsafe."""
         sym = symbol.replace("/USDT", "").replace(":USDT", "") + "USDT"
         url = "https://api.bitget.com/api/v2/mix/market/open-interest"
         try:
@@ -89,13 +97,15 @@ class FuturesClient:
                             return float(items[0]["size"])
         except Exception:
             pass
-        return 0.0
+        return None
 
-    async def fetch_cvd(self, symbol: str, limit: int = 500) -> dict:
-        """Cumulative Volume Delta from taker fills — buy pressure vs sell pressure."""
+    async def fetch_cvd(self, symbol: str, limit: int = 500) -> dict | None:
+        """Cumulative Volume Delta from taker fills — buy pressure vs sell pressure.
+        Returns None on failure/no data — was a fake {"cvd_ratio": 0.5, ...} (an
+        exactly-neutral reading indistinguishable from a real balanced market),
+        see fetch_funding_rate docstring for why that's unsafe."""
         sym = symbol.replace("/USDT", "").replace(":USDT", "") + "USDT"
         url = "https://api.bitget.com/api/v2/mix/market/fills-history"
-        result = {"cvd_ratio": 0.5, "cvd_net": 0.0, "buy_vol": 0.0, "sell_vol": 0.0}
         try:
             timeout = aiohttp.ClientTimeout(total=8)
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -113,22 +123,29 @@ class FuturesClient:
                                 sell_vol += size
                         total = buy_vol + sell_vol
                         if total > 0:
-                            result["buy_vol"]   = buy_vol
-                            result["sell_vol"]  = sell_vol
-                            result["cvd_net"]   = buy_vol - sell_vol
-                            result["cvd_ratio"] = buy_vol / total
+                            return {
+                                "buy_vol": buy_vol, "sell_vol": sell_vol,
+                                "cvd_net": buy_vol - sell_vol, "cvd_ratio": buy_vol / total,
+                            }
         except Exception:
             pass
-        return result
+        return None
 
     async def fetch_market_sentiment(self, symbol: str) -> dict:
-        """Fetch live L/S ratio and OI from Bitget public REST API."""
+        """Fetch live L/S ratio and OI from Bitget public REST API. Missing keys
+        (rather than fake values) signal "no data" for whichever sub-fetch
+        failed — callers already use dict.get() with no-op fallbacks for these,
+        so an absent key correctly contributes nothing instead of a fabricated
+        neutral reading. Each sub-fetch has its own try/except (2026-07-23 fix,
+        audit finding H-05 area) — previously one shared try/except around all
+        three meant a failure in the 2nd or 3rd call silently discarded an
+        already-successful earlier result too."""
         sym = symbol.replace("/USDT", "").replace(":USDT", "") + "USDT"
         base = "https://api.bitget.com/api/v2/mix/market"
         result: dict = {}
         timeout = aiohttp.ClientTimeout(total=8)   # 8s hard timeout per symbol
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
                 # Account long/short ratio (last 5 × 1H)
                 async with session.get(f"{base}/long-short?symbol={sym}&productType=USDT-FUTURES&period=1H&limit=5") as r:
                     d = await r.json()
@@ -136,7 +153,10 @@ class FuturesClient:
                         latest = d["data"][-1]
                         result["long_ratio"]  = float(latest["longRatio"])
                         result["short_ratio"] = float(latest["shortRatio"])
+            except Exception:
+                pass
 
+            try:
                 # Position long/short ratio (size-weighted, more reliable)
                 async with session.get(f"{base}/position-long-short?symbol={sym}&productType=USDT-FUTURES&period=1H&limit=5") as r:
                     d = await r.json()
@@ -144,7 +164,10 @@ class FuturesClient:
                         latest = d["data"][-1]
                         result["pos_long_ratio"]  = float(latest["longPositionRatio"])
                         result["pos_short_ratio"] = float(latest["shortPositionRatio"])
+            except Exception:
+                pass
 
+            try:
                 # Current open interest (in base currency)
                 async with session.get(f"{base}/open-interest?symbol={sym}&productType=USDT-FUTURES") as r:
                     d = await r.json()
@@ -152,8 +175,8 @@ class FuturesClient:
                         oi_list = d["data"].get("openInterestList", [])
                         if oi_list:
                             result["open_interest"] = float(oi_list[0]["size"])
-        except Exception:
-            pass
+            except Exception:
+                pass
         return result
 
     async def set_leverage(self, symbol: str, leverage: int):

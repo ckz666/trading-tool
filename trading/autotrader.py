@@ -216,11 +216,27 @@ class AutoTrader:
     # ── single symbol cycle ───────────────────────────────────────────────────
     async def _run_symbol(self, client: FuturesClient, symbol: str):
         try:
+            # These wrappers normalise both raised exceptions AND the explicit
+            # None-on-failure now returned by fetch_funding_rate/fetch_cvd/
+            # fetch_current_oi (2026-07-23 fix, audit finding H-05 — those used
+            # to return fake plausible-looking data like {"rate": 0.0001} or
+            # {"cvd_ratio": 0.5} on failure, indistinguishable from a real
+            # reading) down to the same "no data" empty/zero value this code
+            # already treats as neutral. Confluence-score criteria still fall
+            # back to their own defaults on missing keys either way — closing
+            # that loop fully is a separate, larger follow-up (see project memory).
             async def _safe_funding_history():
                 try:
                     return await asyncio.wait_for(client.fetch_funding_rate_history(symbol, 100), timeout=10)
                 except Exception:
                     return []
+
+            async def _safe_funding_rate():
+                try:
+                    fr = await asyncio.wait_for(client.fetch_funding_rate(symbol), timeout=10)
+                    return fr if fr is not None else {}
+                except Exception:
+                    return {}
 
             async def _safe_sentiment():
                 try:
@@ -230,13 +246,15 @@ class AutoTrader:
 
             async def _safe_cvd():
                 try:
-                    return await asyncio.wait_for(client.fetch_cvd(symbol, 500), timeout=10)
+                    cvd = await asyncio.wait_for(client.fetch_cvd(symbol, 500), timeout=10)
+                    return cvd if cvd is not None else {}
                 except Exception:
                     return {}
 
             async def _safe_oi_current():
                 try:
-                    return await asyncio.wait_for(client.fetch_current_oi(symbol), timeout=6)
+                    oi = await asyncio.wait_for(client.fetch_current_oi(symbol), timeout=6)
+                    return oi if oi is not None else 0.0
                 except Exception:
                     return 0.0
 
@@ -261,7 +279,7 @@ class AutoTrader:
                 client.fetch_ohlcv(symbol, "4h", 100),
                 client.fetch_ohlcv(symbol, "1d", 100),
                 client.fetch_ohlcv(symbol, "15m", 200),
-                client.fetch_funding_rate(symbol),
+                _safe_funding_rate(),
                 _safe_funding_history(),
                 _safe_sentiment(),
                 _safe_cvd(),

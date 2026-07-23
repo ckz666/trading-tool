@@ -317,6 +317,16 @@ class FundingHarvester:
                         perp.fetch_ticker(symbol),
                         perp.fetch_funding_rate(symbol),
                     )
+                    if fr is None:
+                        # fetch_funding_rate() signals a failed fetch with None
+                        # (2026-07-23 fix, audit finding H-05) — it used to return
+                        # a fake {"rate": 0.0001}, indistinguishable from a real
+                        # reading, which this engine would have silently traded
+                        # decisions on. Skip the symbol this cycle instead of
+                        # guessing; an existing position's SL/basis checks below
+                        # still need a real rate too, so skip those as well.
+                        self._log("WARN", "Funding-Rate-Fetch fehlgeschlagen — Zyklus übersprungen", symbol)
+                        continue
                     spot_price, perp_price = spot_t["last"], perp_t["last"]
                     rate = fr["rate"]
                     self.last_rates[symbol] = rate
