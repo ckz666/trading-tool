@@ -9,7 +9,10 @@ from exchange.binance_data import fetch_ohlcv_binance, fetch_funding_rate_histor
 from exchange.market_scanner import get_trending_symbols
 from trading.futures_paper import FuturesPaperEngine, MAINTENANCE_MARGIN
 from trading.risk import RiskManager, RiskConfig
-from ai.ml_signal import predict, get_indicators, detect_market_structure, train as ml_train, _funding_to_series
+from ai.ml_signal import (
+    predict, get_indicators, detect_market_structure, train as ml_train,
+    _funding_to_series, build_features,
+)
 from ai.patterns import detect_patterns
 from ai.vol_regime import classify_vol_regime
 from ai.whale import fetch_news_sentiment
@@ -36,6 +39,31 @@ class AutoTrader:
         min_dir_precision: float = 0.30,
         max_stale_cycles: int = 12,
         stale_conf_floor: float = 0.15,
+        # Soft-gate entry params (2026-07-23) — see _confluence_score/_ml_contribution
+        # and the confluence-computation block in _run_symbol for the full rationale.
+        # Validated via 192-combo walk-forward sweep + BTC/ETH/HYPE out-of-sample check
+        # (project memory), TOP#4 candidate: min_confluence=4, hold_offset=2,
+        # neutral_zone=1, ml_weight=1, skip_contra=True on the BACKTEST's smaller
+        # confluence scale (~11 max/side). Live's _confluence_score has more criteria
+        # (News/CMC/OI/CVD/L-S-ratio/funding-tiered/15M/squeeze — max ~26 after moving
+        # ML's own 3 pts out into _ml_contribution) that were never part of that sweep,
+        # so hold_offset/neutral_zone are scaled ~2.36x (26/11) as a REASONED ADAPTATION,
+        # not a directly re-validated number — min_confluence itself is left at its
+        # already-tuned live value above rather than rescaled from scratch. Run in
+        # parallel paper-trading against the old hard-gate behavior before trusting
+        # this as proven, per DeepSeek's condition #3 (see memory).
+        hold_offset: int = 5,
+        neutral_zone: int = 2,
+        ml_weight: float = 1,
+        skip_contra: bool = True,
+        # Order-flow ML feature (2026-07-23, see ai/ml_signal.py::cvd_zscore_from_ohlcv
+        # + project memory) — wired end-to-end but OFF by default: models were trained
+        # without it (neutral 0.0 fallback matches that), and the model would need
+        # retraining + the same walk-forward validation rigor as the soft-gate change
+        # before this should influence real decisions. Flip on to start feeding a live
+        # z-score of Bitget's cvd_ratio (ring-buffer-normalised, see _run_symbol) once
+        # that validation has happened.
+        use_cvd_feature: bool = False,
     ):
         self.symbols = list(symbols or DEFAULT_SYMBOLS)
         self.timeframe = timeframe
@@ -54,6 +82,11 @@ class AutoTrader:
         self.min_ml_conf: float = min_ml_conf
         self.min_confluence: int = min_confluence
         self.min_dir_precision: float = min_dir_precision
+        self.hold_offset: int = hold_offset
+        self.neutral_zone: int = neutral_zone
+        self.ml_weight: float = ml_weight
+        self.skip_contra: bool = skip_contra
+        self.use_cvd_feature: bool = use_cvd_feature
         # A position rides its hard SL/TP even if the model's own conviction
         # in that direction decays to ~nothing, as long as it never flips to
         # an outright counter-signal — observed in prod as a TAIKO/USDT long
@@ -88,6 +121,7 @@ class AutoTrader:
         self.trending_data: list[dict] = []            # latest scanner results
         self.last_symbol_refresh: str = None
         self._oi_buffer: dict[str, list] = {}         # {symbol: [oi_float, ...]} rolling 300 entries
+        self._cvd_ratio_buffer: dict[str, list] = {}  # {symbol: [cvd_ratio, ...]} rolling 100 entries, see use_cvd_feature
         # News/CMC/Fear&Greed change on a macro timescale, not per 5-min cycle —
         # cached per symbol to avoid hammering RSS feeds and burning CMC's rate-
         # limited free-tier API credits every single cycle for every symbol.
@@ -244,8 +278,23 @@ class AutoTrader:
             market_sentiment["oi_4h_delta"]  = _oi_delta(48)
             market_sentiment["oi_24h_delta"] = _oi_delta(288)
             market_sentiment["oi_current"]   = buf[-1] if buf else 0.0
-            market_sentiment["cvd_ratio"]    = cvd_data.get("cvd_ratio", 0.5)
+            cvd_ratio_now = cvd_data.get("cvd_ratio", 0.5)
+            market_sentiment["cvd_ratio"]    = cvd_ratio_now
             market_sentiment["cvd_net"]      = cvd_data.get("cvd_net", 0.0)
+
+            # ── CVD ring buffer → rolling z-score, feeds the ML cvd_zscore feature
+            # when use_cvd_feature is on (see ai/ml_signal.py::cvd_zscore_from_ohlcv
+            # docstring for why this needs to be z-scored rather than used raw).
+            cvd_buf = self._cvd_ratio_buffer.setdefault(symbol, [])
+            cvd_buf.append(cvd_ratio_now)
+            if len(cvd_buf) > 100:
+                cvd_buf.pop(0)
+            cvd_zscore_live = 0.0
+            if len(cvd_buf) >= 20:
+                cvd_arr = pd.Series(cvd_buf)
+                cvd_std = cvd_arr.std()
+                if cvd_std > 0:
+                    cvd_zscore_live = float((cvd_arr.iloc[-1] - cvd_arr.mean()) / cvd_std)
 
             # News headlines (RSS-scraped) + CoinMarketCap (Fear&Greed, global
             # market, coin-specific momentum) — cached up to 15min, see _safe_news_cmc.
@@ -319,10 +368,18 @@ class AutoTrader:
                 return
 
             # ── ML signal ──
+            # cvd_zscore feature only fed when use_cvd_feature is on (default off,
+            # see constructor docstring) — models were trained without it, so the
+            # neutral 0.0 fallback in build_features() is what they expect otherwise.
             loop = asyncio.get_event_loop()
-            ml_signal = await loop.run_in_executor(
-                self._executor, lambda: predict(df, symbol, funding_series=funding_series)
-            )
+            def _predict_this_bar():
+                feats = None
+                if self.use_cvd_feature:
+                    cvd_series = pd.Series(cvd_zscore_live, index=df.index)
+                    feats = build_features(df, funding_series=funding_series,
+                                            precomputed_cvd_zscore=cvd_series)
+                return predict(df, symbol, funding_series=funding_series, features=feats)
+            ml_signal = await loop.run_in_executor(self._executor, _predict_this_bar)
             indicators_quick = get_indicators(df)
             ml_signal["regime"] = indicators_quick.get("regime", "unknown")
             ml_signal["adx"]    = indicators_quick.get("adx", 0)
@@ -333,29 +390,47 @@ class AutoTrader:
             label        = ml_signal["label"]   # "buy" | "sell" | "hold"
 
             # ── MTF indicators (1D + 15M) ─────────────────────────────────────
-            ind_1d  = get_indicators(df_1d)  if len(df_1d)  > 20 else None
+            # >30, not >20: ADX needs >=2x its window (28 for window=14) or the ta
+            # library indexes past the end of the series instead of returning NaN
+            # (see ai/ml_signal.py::_resample_htf_indicators for the same guard) —
+            # was inconsistent with ind_15m's threshold below, caused an IndexError
+            # crash on thin-history symbols (e.g. SKHY/USDT, freshly listed).
+            ind_1d  = get_indicators(df_1d)  if len(df_1d)  > 30 else None
             ind_15m = get_indicators(df_15m) if len(df_15m) > 30 else None
 
-            # ── Confluence filter ─────────────────────────────────────────────
-            # Always compute when ML has a direction (not hold) or position open.
-            # Confluence replaces the old confidence-only gate.
-            confluence_score, confluence_reasons = 0, []
-            if label != "hold" or has_position:
-                patterns_quick = detect_patterns(df)
-                confluence_score, confluence_reasons = self._confluence_score(
-                    ml_signal, indicators_quick, patterns_quick, df_4h,
-                    ind_1d=ind_1d, ind_15m=ind_15m, sentiment=market_sentiment,
-                )
+            # ── Confluence — bidirectional soft-gate (2026-07-23) ─────────────
+            # Computed for BOTH directions unconditionally (not gated on the ML
+            # label) so a strong technical signal can still open a trade when ML
+            # says "hold", and so open-position management always has a real
+            # is_long-conditioned score to compare against. See _confluence_score
+            # and _ml_contribution docstrings + the constructor's soft-gate params
+            # for the full rationale and validation history.
+            patterns_quick = detect_patterns(df)
+            score_long, reasons_long = self._confluence_score(
+                True, indicators_quick, patterns_quick, df_4h,
+                ind_1d=ind_1d, ind_15m=ind_15m, sentiment=market_sentiment,
+            )
+            score_short, reasons_short = self._confluence_score(
+                False, indicators_quick, patterns_quick, df_4h,
+                ind_1d=ind_1d, ind_15m=ind_15m, sentiment=market_sentiment,
+            )
+            ml_long, ml_short = self._ml_contribution(
+                label, conf, ml_signal.get("agreement", 0.0), self.min_ml_conf, self.ml_weight
+            )
+            score_long  += ml_long
+            score_short += ml_short
+            confluence_score   = score_long if score_long >= score_short else score_short
+            confluence_reasons = reasons_long if score_long >= score_short else reasons_short
 
             # ── Rule-based decision (no Claude) ──────────────────────────────────
             MIN_CONFLUENCE = self.min_confluence
-            MIN_CONF       = self.min_ml_conf
 
             di_score   = ml_signal.get("di_score", 0.0)
             di_blocked = ml_signal.get("di_blocked", False)
 
             self._log("INFO",
-                f"ML → {label.upper()} conf={conf:.2f} | DI={di_score:.2f} | C={confluence_score}/24",
+                f"ML → {label.upper()} conf={conf:.2f} | DI={di_score:.2f} | "
+                f"C_long={score_long} C_short={score_short}/26",
                 symbol)
 
             action = "hold"
@@ -369,9 +444,10 @@ class AutoTrader:
                 cur_pos = self.engine.positions.get(symbol)
                 if cur_pos:
                     is_long = cur_pos.side == "long"
+                    pos_confluence = score_long if is_long else score_short
                     counter = (is_long and label == "sell") or (not is_long and label == "buy")
                     supportive = (is_long and label == "buy") or (not is_long and label == "sell")
-                    if counter and conf >= 0.65 and confluence_score >= MIN_CONFLUENCE:
+                    if counter and conf >= 0.65 and pos_confluence >= MIN_CONFLUENCE:
                         action = "close_long" if is_long else "close_short"
                         skip_reason = None
                     elif supportive and conf >= self.stale_conf_floor:
@@ -394,8 +470,6 @@ class AutoTrader:
                                 symbol)
                         else:
                             skip_reason = "position open — managed by SL/TP"
-            elif label == "hold":
-                skip_reason = "ML → HOLD"
             elif di_blocked:
                 skip_reason = f"DI={di_score:.2f} — Regime-Shift, kein Entry"
             elif self.model_dir_precision.get(symbol, 0.0) < self.min_dir_precision:
@@ -403,17 +477,34 @@ class AutoTrader:
                     f"Modellqualität zu niedrig (dir_precision="
                     f"{self.model_dir_precision.get(symbol, 0.0):.0%} < {self.min_dir_precision:.0%})"
                 )
-            elif conf < MIN_CONF:
-                skip_reason = f"conf={conf:.2f} < {MIN_CONF}"
-            elif confluence_score < MIN_CONFLUENCE:
-                skip_reason = f"C={confluence_score}/24 < {MIN_CONFLUENCE}"
-            elif self._same_direction_count(label) >= self.max_same_direction:
-                skip_reason = (
-                    f"Richtungslimit erreicht ({label}: "
-                    f"{self._same_direction_count(label)}/{self.max_same_direction}) — Korrelationsrisiko"
-                )
             else:
-                action = "open_long" if label == "buy" else "open_short"
+                ml_was_hold     = (label == "hold")
+                eff_min         = MIN_CONFLUENCE + (self.hold_offset if ml_was_hold else 0)
+                best            = max(score_long, score_short)
+                entry_direction = "long" if score_long >= score_short else "short"
+                label_direction = "long" if label == "buy" else ("short" if label == "sell" else None)
+
+                if best < eff_min:
+                    skip_reason = f"C={best}/26 < {eff_min}" + (" (ML=hold — höhere Hürde)" if ml_was_hold else "")
+                elif abs(score_long - score_short) < self.neutral_zone:
+                    skip_reason = f"Neutralzone |{score_long}-{score_short}| < {self.neutral_zone}"
+                elif self.skip_contra and label_direction and entry_direction != label_direction:
+                    skip_reason = f"konträr zu ML-Label ({label}) — Skip-Filter aktiv"
+                elif self._same_direction_count("buy" if entry_direction == "long" else "sell") >= self.max_same_direction:
+                    skip_reason = (
+                        f"Richtungslimit erreicht ({entry_direction}: "
+                        f"{self._same_direction_count('buy' if entry_direction == 'long' else 'sell')}/{self.max_same_direction}) — Korrelationsrisiko"
+                    )
+                else:
+                    action = "open_long" if entry_direction == "long" else "open_short"
+                    confluence_score   = best
+                    confluence_reasons = reasons_long if entry_direction == "long" else reasons_short
+                    if ml_was_hold:
+                        # keep `label` in sync with the direction we're actually
+                        # trading so downstream logging/_same_direction_count stay
+                        # consistent for entries the soft-gate opened without an
+                        # ML opinion (label was "hold" going into this branch)
+                        label = "buy" if entry_direction == "long" else "sell"
 
             # ── Scalp fallback: trend path declined, but the market is ranging
             # (ADX < 20 → no real trend) — try mean-reversion instead of sitting
@@ -467,11 +558,11 @@ class AutoTrader:
             reasons_str = " | ".join(confluence_reasons[:4])
             mode_tag = "SCALP " if trade_mode == "scalp" else ""
             self._log("INFO",
-                f"SIGNAL {mode_tag}{action.upper()} | C={confluence_score}/24 | conf={conf:.2f} | SL={sl_pct:.1%} TP={tp_pct:.1%} | {reasons_str}",
+                f"SIGNAL {mode_tag}{action.upper()} | C={confluence_score}/26 | conf={conf:.2f} | SL={sl_pct:.1%} TP={tp_pct:.1%} | {reasons_str}",
                 symbol)
 
             reasoning = (reasons_str if trade_mode == "scalp" else
-                         f"Rule: C={confluence_score}/24 ≥ {MIN_CONFLUENCE}, conf={conf:.2f} ≥ {MIN_CONF}. {reasons_str}")
+                         f"Rule: C={confluence_score}/26 ≥ {MIN_CONFLUENCE}. {reasons_str}")
             decision = {
                 "action": action, "confidence": conf, "mode": trade_mode,
                 "reasoning": reasoning,
@@ -722,6 +813,11 @@ class AutoTrader:
             "min_claude_confidence": self.min_claude_confidence,
             "min_ml_conf": self.min_ml_conf,
             "min_confluence": self.min_confluence,
+            "hold_offset": self.hold_offset,
+            "neutral_zone": self.neutral_zone,
+            "ml_weight": self.ml_weight,
+            "skip_contra": self.skip_contra,
+            "use_cvd_feature": self.use_cvd_feature,
             "min_dir_precision": self.min_dir_precision,
             "max_stale_cycles": self.max_stale_cycles,
             "stale_conf_floor": self.stale_conf_floor,
@@ -805,9 +901,28 @@ class AutoTrader:
         return kelly_pct if kelly_pct is not None else default_pct
 
     # ── confluence score ──────────────────────────────────────────────────────
+    @staticmethod
+    def _ml_contribution(label: str, conf: float, agreement: float,
+                          min_conf: float, ml_weight: float) -> tuple[int, int]:
+        """
+        ML's own weighted vote — added on top of the (direction-independent)
+        confluence score below instead of hard-gating it. Confidence only gates
+        whether ML has a usable opinion at all (proven flat/uninformative in
+        [0, 0.40], see ML diagnosis 2026-07-22) — NOT used to scale the point
+        size. Agreement (fraction of the 3-model ensemble voting the same way)
+        sets the magnitude instead. Mirrors ai/backtest.py::_ml_contribution /
+        ai/sweep.py::_ml_points — same design, kept as a separate copy per this
+        repo's live/backtest mirroring convention (see Kelly/Ichimoku).
+        Returns (points_to_long, points_to_short) — 0/0 when ML has no usable opinion.
+        """
+        if label == "hold" or conf < min_conf or agreement < 0.67:
+            return 0, 0
+        pts = ml_weight * (2 if agreement >= 0.99 else 1)
+        return (pts, 0) if label == "buy" else (0, pts)
+
     def _confluence_score(
         self,
-        ml_signal: dict,
+        is_long: bool,
         indicators: dict,
         patterns: dict,
         df_4h,
@@ -816,32 +931,20 @@ class AutoTrader:
         sentiment: dict = None,
     ) -> tuple[int, list[str]]:
         """
-        Score 0-27: signals across 1D/4H/1H/15M + on-chain + flow + macro/news align with ML direction.
-        Layers: ML(2) + Ensemble(1) + 1H-RSI(1) + 1H-MACD(1) + 1H-EMA(1)
-                + VWAP(1) + 4H-structure(2) + Candle(1) + 1D-trend(2) + 15M-mom(2)
-                + Squeeze(2) + Funding-tiered(2) + L/S-ratio(1) + OI-delta(2) + CVD(2)
-                + Ichimoku(2) + News(1) + CMC-composite(2)
+        Score across 1D/4H/1H/15M + on-chain + flow + macro/news signals that support
+        the given direction (~26 max between this and _ml_contribution combined).
+        Direction-independent (soft-gate, 2026-07-23): caller decides is_long and calls
+        this once per side per bar so both directions can be compared even when the ML
+        label is 'hold' — see the confluence-computation block in _run_symbol and
+        _ml_contribution for how ML itself weighs in.
+        Layers: 1H-RSI(1) + 1H-MACD(1) + 1H-EMA(1) + VWAP(1) + 4H-structure(2) +
+                Candle(1) + 1D-trend(2) + 15M-mom(2) + Squeeze(2) + Funding-tiered(2)
+                + L/S-ratio(1) + OI-delta(2) + CVD(2) + Ichimoku(2) + News(1) + CMC-composite(2)
         """
-        label = ml_signal.get("label")
-        if label == "hold":
-            return 0, []
-
-        is_long = (label == "buy")
         score   = 0
         reasons = []
 
-        # 1. ML confidence (0-2 pts)
-        conf = ml_signal.get("confidence", 0)
-        if conf >= 0.72:
-            score += 2; reasons.append(f"ML sehr zuversichtlich ({conf:.0%})")
-        elif conf >= 0.65:
-            score += 1; reasons.append(f"ML zuversichtlich ({conf:.0%})")
-
-        # 2. Ensemble agreement (0-1 pt)
-        if ml_signal.get("agreement", 1.0) >= 0.67:
-            score += 1; reasons.append(f"3 Modelle einig ({ml_signal['agreement']:.0%})")
-
-        # 3. RSI positioning (0-1 pt)
+        # 1. RSI positioning (0-1 pt)
         rsi = indicators.get("rsi", 50)
         if is_long and rsi < 42:
             score += 1; reasons.append(f"RSI überverkauft ({rsi:.0f})")
@@ -1042,7 +1145,11 @@ class AutoTrader:
                     pts = bearish_tiers[cmc_bias]
                     score += pts; reasons.append(f"CMC {cmc_bias} (score={sentiment.get('cmc_signal_score',0):+.1f}{fg_str})")
 
-        return max(score, 0), reasons
+        # No clamp-to-0 here (unlike the old single-direction version) — this gets
+        # compared against the opposite direction's score via argmax in _run_symbol,
+        # so a negative score (net-bearish for the direction being scored) needs to
+        # stay negative for that comparison to be meaningful.
+        return score, reasons
 
     def get_log(self, limit: int = 50, symbol: str = None) -> list:
         logs = self.log

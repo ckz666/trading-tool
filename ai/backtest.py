@@ -1,9 +1,13 @@
 """
 MTF Backtest Engine
 Walk-forward simulation: train on first 70% of 1H data, test on remaining 30%.
-For each test bar: ML signal + MTF confluence → simulate trade with ATR-based SL/TP
-and Kelly-scaled ATR position sizing (mirrors trading/autotrader.py).
-Claude is not included (too expensive) — uses rule: conf >= threshold AND confluence >= min_conf.
+For each test bar: confluence is computed for BOTH directions independently of the
+ML label (soft-gate, 2026-07-22) — ML contributes weighted points via agreement,
+not as a hard pre-filter. Direction = side with the higher score; trade fires only
+if the winning score clears min_confluence (raised when ML itself had no opinion)
+and leads the losing side by a margin (neutral-zone guard against coin-flip bars).
+Position sizing mirrors trading/autotrader.py (Kelly + vol-regime).
+Claude is not included (too expensive).
 """
 
 import numpy as np
@@ -12,10 +16,10 @@ from typing import Optional
 
 from ai.ml_signal import (
     build_features, make_labels, train as ml_train,
-    get_indicators, detect_market_structure, _funding_to_series,
+    get_indicators, detect_market_structure, _funding_to_series, _pattern_signal,
 )
 from ai.patterns import detect_patterns
-from ai.vol_regime import classify_vol_regime
+from ai.vol_regime import classify_vol_regime, rolling_prob_storm
 from trading.risk import RiskManager, RiskConfig
 from trading.montecarlo import resample_drawdown
 
@@ -43,17 +47,17 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
-def _confluence_score_bt(ml_label: str, ml_conf: float, ind_1h: dict,
+def _confluence_score_bt(is_long: bool, ind_1h: dict,
                           ind_4h: dict = None, ind_1d: dict = None,
                           patterns: dict = None) -> int:
-    """Lightweight confluence for backtesting (no live sentiment/OI/CVD — max ≈20 of 24)."""
-    if ml_label == "hold":
-        return 0
-    is_long = ml_label == "buy"
+    """
+    Lightweight confluence for backtesting (no live sentiment/OI/CVD — max ≈18 of 24).
+    Direction-conditioned: caller decides is_long, this scores how much the other
+    (non-ML) indicators support that direction. Called once per side per bar so both
+    directions can be compared even when the ML label is 'hold' (soft-gate, see
+    _ml_contribution for how ML itself weighs in).
+    """
     score = 0
-
-    if ml_conf >= 0.72: score += 2
-    elif ml_conf >= 0.65: score += 1
 
     rsi = ind_1h.get("rsi", 50)
     if is_long and rsi < 42: score += 1
@@ -105,7 +109,21 @@ def _confluence_score_bt(ml_label: str, ml_conf: float, ind_1h: dict,
             elif pos_ == "below": score += 1
             elif pos_ == "above": score -= 1
 
-    return max(score, 0)
+    return score
+
+
+def _ml_contribution(label: str, conf: float, agreement: float, min_conf: float) -> tuple[int, int]:
+    """
+    ML's own weighted vote, added on top of the (now ML-independent) confluence score.
+    Confidence only gates whether ML has an opinion at all — it is proven flat/uninformative
+    in [0, 0.40] (see ML diagnosis 2026-07-22) so it is NOT used to scale the point size.
+    Agreement (fraction of the 3-model ensemble voting the same way) sets the magnitude instead.
+    Returns (points_to_long, points_to_short) — 0/0 when ML has no usable opinion.
+    """
+    if label == "hold" or conf < min_conf or agreement < 0.67:
+        return 0, 0
+    pts = 2 if agreement >= 0.99 else 1
+    return (pts, 0) if label == "buy" else (0, pts)
 
 
 # ── main backtest ─────────────────────────────────────────────────────────────
@@ -159,6 +177,15 @@ def run_backtest(
 
     # Pre-compute ATR for test set (using full df so warm-up is correct)
     atr_full = _atr(df_1h)
+
+    # Pre-compute the two expensive rolling features ONCE over the full series
+    # instead of recomputing them from scratch on every sliding test-window (the
+    # dominant cost in a walk-forward run — both are strictly causal with a fixed
+    # trailing lookback that matches `lookback` below, so this is exactly the same
+    # values, just computed once instead of len(df_test) times). See build_features().
+    _progress("Pre-compute Pattern-Signal & Vol-Regime über volle Historie…")
+    pattern_signal_full = _pattern_signal(df_1h)
+    prob_storm_full      = rolling_prob_storm(df_1h)
 
     # ── Walk-forward through test bars ───────────────────────────────────────
     trades = []
@@ -219,6 +246,7 @@ def run_backtest(
                     "ml_conf":   open_trade["ml_conf"],
                     "risk_pct":  open_trade["risk_pct"],
                     "vol_regime":open_trade["vol_regime"],
+                    "ml_was_hold":open_trade["ml_was_hold"],
                     "pnl_usdt":  round(net_pnl, 2),
                     "pnl_pct":   round(roe_pct, 3),
                     "cash_after":round(cash, 2),
@@ -241,20 +269,34 @@ def run_backtest(
         if funding_series is not None and not funding_series.empty:
             fs_window = funding_series[funding_series.index <= ts]
 
-        # ML signal on current window
+        # Feature pipeline computed once per bar and reused for both the ML signal
+        # and the indicator snapshot below — build_features() is the expensive part
+        # (_pattern_signal/rolling_prob_storm scan the whole window) and predict()/
+        # get_indicators() used to each recompute it separately on identical data.
         try:
-            sig = predict(window_1h, symbol, funding_series=fs_window)
+            feats_1h = build_features(
+                window_1h, funding_series=fs_window,
+                precomputed_pattern_signal=pattern_signal_full,
+                precomputed_prob_storm=prob_storm_full,
+            )
         except Exception:
             continue
 
-        ml_label = sig.get("label", "hold")
-        ml_conf  = sig.get("confidence", 0.0)
-
-        if ml_label == "hold" or ml_conf < min_conf:
+        # ML signal on current window
+        try:
+            sig = predict(window_1h, symbol, funding_series=fs_window, features=feats_1h)
+        except Exception:
             continue
 
+        ml_label     = sig.get("label", "hold")
+        ml_conf      = sig.get("confidence", 0.0)
+        ml_agreement = sig.get("agreement", 0.0)
+        ml_was_hold  = (ml_label == "hold")
+
         # MTF: aggregate 1H → 4H and 1D for confluence
-        ind_1h = get_indicators(window_1h)
+        # (always computed now — soft-gate needs both directions scored even on
+        # bars where ML itself has no opinion, see backtest.py module docstring)
+        ind_1h = get_indicators(window_1h, features=feats_1h)
         ind_4h, ind_1d = None, None
         try:
             df_4h_w = _resample_ohlcv(window_1h, "4h")
@@ -275,13 +317,23 @@ def run_backtest(
         except Exception:
             pats = {}
 
-        confluence = _confluence_score_bt(ml_label, ml_conf, ind_1h, ind_4h, ind_1d, pats)
+        score_long  = _confluence_score_bt(True,  ind_1h, ind_4h, ind_1d, pats)
+        score_short = _confluence_score_bt(False, ind_1h, ind_4h, ind_1d, pats)
+        ml_long, ml_short = _ml_contribution(ml_label, ml_conf, ml_agreement, min_conf)
+        score_long  += ml_long
+        score_short += ml_short
 
-        if confluence < min_confluence:
+        # ML had no opinion → other 17 criteria must be unusually strong before we trade at all
+        effective_min = min_confluence + (2 if ml_was_hold else 0)
+        best = max(score_long, score_short)
+
+        if best < effective_min or abs(score_long - score_short) < 2:
             continue
 
+        confluence = best
+
         # ── Open trade (Kelly-scaled ATR position sizing, mirrors AutoTrader) ────
-        side  = "long" if ml_label == "buy" else "short"
+        side  = "long" if score_long >= score_short else "short"
         sl    = price - atr * atr_sl_mult if side == "long" else price + atr * atr_sl_mult
         tp    = price + atr * atr_tp_mult if side == "long" else price - atr * atr_tp_mult
 
@@ -301,7 +353,7 @@ def run_backtest(
             "side": side, "entry": price, "sl": sl, "tp": tp,
             "entry_ts": ts, "confluence": confluence, "ml_conf": round(ml_conf, 3),
             "amount": amount, "margin": margin, "risk_pct": round(risk_pct, 4),
-            "vol_regime": vol_regime["regime"],
+            "vol_regime": vol_regime["regime"], "ml_was_hold": ml_was_hold,
         }
         regime_tag = f" | {vol_regime['regime'].upper()}" if vol_regime["regime"] == "storm" else ""
         _progress(f"{ts} OPEN {side.upper()} @ {price:.4f} | C={confluence} conf={ml_conf:.2f} | "
@@ -332,6 +384,7 @@ def run_backtest(
             "ml_conf":    open_trade["ml_conf"],
             "risk_pct":   open_trade["risk_pct"],
             "vol_regime": open_trade["vol_regime"],
+            "ml_was_hold":open_trade["ml_was_hold"],
             "pnl_usdt":   round(net_pnl, 2),
             "pnl_pct":    round(roe_pct, 3),
             "cash_after": round(cash, 2),
@@ -374,6 +427,38 @@ def run_backtest(
     win_rate = round(len(wins) / len(trades) * 100, 1)
     _progress(f"Backtest fertig — {len(trades)} Trades | WR {win_rate}% | Return {total_return_pct:+.2f}% | Sharpe {sharpe}")
 
+    # ── ml_was_hold breakdown ── trades that ONLY exist because of the soft-gate
+    # (the old hard-gate would have skipped these outright since ML said "hold").
+    # Isolate them to check they're not dragging performance down (see brainstorm
+    # with DeepSeek 2026-07-22 on validating the soft-gate migration).
+    hold_group = [t for t in trades if t.get("ml_was_hold")]
+    ml_group   = [t for t in trades if not t.get("ml_was_hold")]
+
+    def _group_stats(group: list[dict]) -> dict:
+        if not group:
+            return {"trades": 0}
+        g_pnls   = [t["pnl_pct"] for t in group]
+        g_wins   = [p for p in g_pnls if p > 0]
+        g_losses = [p for p in g_pnls if p <= 0]
+        return {
+            "trades":        len(group),
+            "win_rate":      round(len(g_wins) / len(group) * 100, 1),
+            "profit_factor": round(abs(sum(g_wins) / sum(g_losses)), 2) if g_losses else 99.0,
+            "net_pnl_usdt":  round(sum(t["pnl_usdt"] for t in group), 2),
+        }
+
+    ml_hold_breakdown = {
+        "hold_group": _group_stats(hold_group),   # soft-gate-only trades, ML had no opinion
+        "ml_group":   _group_stats(ml_group),      # ML had a directional opinion, as before
+    }
+    if hold_group:
+        _progress(
+            f"Soft-Gate-Trades (ML=hold): {len(hold_group)}/{len(trades)} | "
+            f"WR {ml_hold_breakdown['hold_group']['win_rate']}% | "
+            f"PF {ml_hold_breakdown['hold_group']['profit_factor']} | "
+            f"Net ${ml_hold_breakdown['hold_group']['net_pnl_usdt']:+.2f}"
+        )
+
     mc = resample_drawdown(trades, RiskConfig(), n_sims=2000, start_equity=1000.0)
     if mc:
         _progress(
@@ -406,6 +491,7 @@ def run_backtest(
         "total_return_pct":total_return_pct,
         "max_drawdown_pct":round(max_dd * 100, 2),
         "sharpe":          sharpe,
+        "ml_hold_breakdown": ml_hold_breakdown,
         "trade_log":       trades,
         "equity_curve":    equity_curve[-200:],  # last 200 points for chart
         "monte_carlo":     mc,

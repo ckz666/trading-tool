@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Bitget Trading Tool", lifespan=lifespan)
 
-WATCH_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+WATCH_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
 
 
 def _add_watch_symbols(symbols: list[str]):
@@ -371,6 +371,10 @@ class AutotraderStartRequest(BaseModel):
     min_dir_precision: float = 0.30
     max_stale_cycles: int = 12
     stale_conf_floor: float = 0.15
+    hold_offset: int = 5
+    neutral_zone: int = 2
+    ml_weight: float = 1
+    skip_contra: bool = True
 
 
 @app.post("/api/autotrader/start")
@@ -404,6 +408,10 @@ async def start_autotrader(req: AutotraderStartRequest):
             min_dir_precision=req.min_dir_precision,
             max_stale_cycles=req.max_stale_cycles,
             stale_conf_floor=req.stale_conf_floor,
+            hold_offset=req.hold_offset,
+            neutral_zone=req.neutral_zone,
+            ml_weight=req.ml_weight,
+            skip_contra=req.skip_contra,
         )
         _add_watch_symbols(req.symbols)
         train_results = await autotrader.startup()
@@ -430,6 +438,10 @@ class AutotraderConfigPatch(BaseModel):
     min_dir_precision: float = None
     max_stale_cycles: int = None
     stale_conf_floor: float = None
+    hold_offset: int = None
+    neutral_zone: int = None
+    ml_weight: float = None
+    skip_contra: bool = None
 
 @app.patch("/api/autotrader/config")
 def patch_autotrader_config(patch: AutotraderConfigPatch):
@@ -460,6 +472,18 @@ def patch_autotrader_config(patch: AutotraderConfigPatch):
     if patch.stale_conf_floor is not None:
         autotrader.stale_conf_floor = patch.stale_conf_floor
         changed["stale_conf_floor"] = patch.stale_conf_floor
+    if patch.hold_offset is not None:
+        autotrader.hold_offset = patch.hold_offset
+        changed["hold_offset"] = patch.hold_offset
+    if patch.neutral_zone is not None:
+        autotrader.neutral_zone = patch.neutral_zone
+        changed["neutral_zone"] = patch.neutral_zone
+    if patch.ml_weight is not None:
+        autotrader.ml_weight = patch.ml_weight
+        changed["ml_weight"] = patch.ml_weight
+    if patch.skip_contra is not None:
+        autotrader.skip_contra = patch.skip_contra
+        changed["skip_contra"] = patch.skip_contra
     return {"status": "updated", "changed": changed}
 
 

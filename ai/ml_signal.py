@@ -48,6 +48,33 @@ def _funding_to_series(funding_records: list) -> pd.Series:
     return s.resample("1h").last().ffill()
 
 
+def cvd_zscore_from_ohlcv(df: pd.DataFrame, window: int = 100) -> pd.Series:
+    """
+    Order-flow feature (2026-07-23, see project memory): rolling z-score of
+    cumulative taker buy/sell volume delta (CVD). Z-scored rather than used raw
+    because training data comes from Binance klines (taker_buy_volume column,
+    full 200+ day history) while live inference has to use Bitget's own CVD
+    (FuturesClient.fetch_cvd() — a live snapshot ratio from the last N fills, no
+    history). Those two sources aren't comparable in raw scale/methodology
+    (different exchanges, different volume populations, fixed-hour-bucket vs.
+    fixed-trade-count), but a window-relative z-score expresses the same
+    structural signal (bullish/bearish taker pressure relative to its own recent
+    context) in both, the same way funding_norm already bridges Binance-trained /
+    Bitget-live funding rate data.
+    df must have a 'taker_buy_volume' column (see fetch_ohlcv_binance(...,
+    include_taker_volume=True)) and 'volume'. Returns NaN before `window` bars
+    of history exist — build_features() fills that as neutral (0.0), same
+    convention as the rest of the warmup handling in this module.
+    """
+    if "taker_buy_volume" not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    taker_sell = df["volume"] - df["taker_buy_volume"]
+    cvd = (df["taker_buy_volume"] - taker_sell).cumsum()
+    roll_mean = cvd.rolling(window).mean()
+    roll_std  = cvd.rolling(window).std()
+    return ((cvd - roll_mean) / roll_std.replace(0, pd.NA)).fillna(0.0)
+
+
 def _squeeze_indicators(df: pd.DataFrame, period: int = 20,
                          bb_mult: float = 2.0, kc_mult: float = 1.5) -> pd.DataFrame:
     """
@@ -140,7 +167,28 @@ def _pattern_signal(df: pd.DataFrame) -> pd.Series:
     return signal
 
 
-def build_features(df: pd.DataFrame, funding_series: pd.Series = None) -> pd.DataFrame:
+def build_features(df: pd.DataFrame, funding_series: pd.Series = None,
+                    precomputed_pattern_signal: pd.Series = None,
+                    precomputed_prob_storm: pd.Series = None,
+                    precomputed_cvd_zscore: pd.Series = None) -> pd.DataFrame:
+    """
+    precomputed_pattern_signal / precomputed_prob_storm: optional, already-computed
+    _pattern_signal()/rolling_prob_storm() results covering (at least) df's index range.
+    Both are strictly causal with a fixed trailing lookback, so a value for a given
+    timestamp is identical whether computed on the full history or on a window ending
+    at that timestamp — safe to reindex from a precomputed series instead of recomputing.
+    Backtest-only optimisation (see ai/backtest.py): recomputing these from scratch on
+    every sliding test-window is the dominant cost in a walk-forward run. Live callers
+    never pass these, so behaviour there is unchanged.
+
+    precomputed_cvd_zscore: optional aligned series, see cvd_zscore_from_ohlcv(). Live
+    callers pass their own ring-buffer-based z-score here (df has no taker_buy_volume
+    column from Bitget) — when omitted, falls back to computing it from df directly,
+    which itself no-ops to neutral 0.0 if df lacks a taker_buy_volume column (true for
+    every caller that hasn't opted into fetch_ohlcv_binance(..., include_taker_volume=True)
+    or an explicit live z-score, i.e. everyone as of 2026-07-23 — feature is wired but
+    inert until a caller actually opts in, see project memory).
+    """
     f = pd.DataFrame(index=df.index)
 
     # Momentum (3 core features, non-redundant)
@@ -192,6 +240,12 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None) -> pd.Dat
         f["funding_norm"]  = 0.0
         f["funding_trend"] = 0.0
 
+    # Order flow (1 feature, 2026-07-23): rolling z-score of taker buy/sell volume
+    # delta (CVD) — see cvd_zscore_from_ohlcv() docstring for why it's z-scored
+    # (Binance-trained / Bitget-live source mismatch) and inert-by-default rationale.
+    f["cvd_zscore"] = (precomputed_cvd_zscore.reindex(df.index).fillna(0.0)
+                        if precomputed_cvd_zscore is not None else cvd_zscore_from_ohlcv(df))
+
     # 4H context (4 features: resampled from this same 1h data, no extra fetch —
     # lets the model see whether the bigger-picture trend agrees with the 1h read).
     # Neutral-filled rather than left NaN during the 4H-indicator warmup window,
@@ -205,7 +259,8 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None) -> pd.Dat
 
     # Candlestick pattern signal (1 feature): lets the ensemble learn nonlinear
     # combinations of the same patterns the confluence scorer already checks
-    f["pattern_signal"] = _pattern_signal(df)
+    f["pattern_signal"] = (precomputed_pattern_signal.reindex(df.index)
+                            if precomputed_pattern_signal is not None else _pattern_signal(df))
 
     # Cycle strength (1 feature): detrended, differenced, Hann-windowed dominant-
     # frequency power — see ai/spectral_guard.py. Deliberately NOT computed on raw
@@ -218,7 +273,8 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None) -> pd.Dat
     # (ai/vol_regime.py::classify_vol_regime multiplies risk_pct post-hoc), now
     # also given to the model directly so it can learn regime-conditional
     # patterns instead of only having its output de-rated after the fact.
-    f["prob_storm"] = rolling_prob_storm(df)
+    f["prob_storm"] = (precomputed_prob_storm.reindex(df.index)
+                        if precomputed_prob_storm is not None else rolling_prob_storm(df))
 
     return f
 
@@ -389,13 +445,18 @@ def train(df: pd.DataFrame, symbol: str = "BTC/USDT",
 
 
 def predict(df: pd.DataFrame, symbol: str = "BTC/USDT",
-            funding_series: pd.Series = None) -> dict:
-    """Ensemble vote from 3 models. Falls back to legacy single model if needed."""
+            funding_series: pd.Series = None, features: pd.DataFrame = None) -> dict:
+    """
+    Ensemble vote from 3 models. Falls back to legacy single model if needed.
+    `features`: optional pre-computed build_features(df, funding_series) result, see
+    get_indicators() docstring — skips the internal recomputation when supplied.
+    """
     model_paths, scaler_path = _paths(symbol)
 
     # Try ensemble first
     if all(os.path.exists(p) for p in model_paths.values()) and os.path.exists(scaler_path):
-        return _predict_ensemble(df, model_paths, scaler_path, funding_series=funding_series, symbol=symbol)
+        return _predict_ensemble(df, model_paths, scaler_path, funding_series=funding_series,
+                                  symbol=symbol, features=features)
 
     # Fallback to old single-model
     legacy_model, legacy_scaler = _legacy_path(symbol)
@@ -427,13 +488,15 @@ def _compute_di(X_scaled: np.ndarray, symbol: str) -> float:
 
 
 def _predict_ensemble(df: pd.DataFrame, model_paths: dict, scaler_path: str,
-                      funding_series: pd.Series = None, symbol: str = "") -> dict:
+                      funding_series: pd.Series = None, symbol: str = "",
+                      features: pd.DataFrame = None) -> dict:
     models = {}
     for key, path in model_paths.items():
         with open(path, "rb") as f: models[key] = pickle.load(f)
     with open(scaler_path, "rb") as f: scaler = pickle.load(f)
 
-    features = build_features(df, funding_series=funding_series)
+    if features is None:
+        features = build_features(df, funding_series=funding_series)
     last = features.iloc[[-1]].dropna(axis=1)
     expected_cols = scaler.feature_names_in_
     for col in expected_cols:
@@ -642,9 +705,15 @@ def calc_ichimoku(df: pd.DataFrame, tenkan_n: int = 9, kijun_n: int = 26,
     }
 
 
-def get_indicators(df: pd.DataFrame) -> dict:
-    """Return current indicator values + market structure for context."""
-    f = build_features(df)
+def get_indicators(df: pd.DataFrame, features: pd.DataFrame = None) -> dict:
+    """
+    Return current indicator values + market structure for context.
+    `features`: optional pre-computed build_features(df) result — pass this when the
+    caller already built it (e.g. right before calling predict() on the same df) to
+    avoid recomputing the expensive feature pipeline (_pattern_signal, rolling_prob_storm)
+    a second time on identical data. Defaults to None so existing callers are unaffected.
+    """
+    f = features if features is not None else build_features(df)
     last = f.iloc[-1]
     adx = float(last.get("adx", 0))
 

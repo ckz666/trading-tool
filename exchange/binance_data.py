@@ -23,11 +23,19 @@ async def fetch_ohlcv_binance(
     symbol: str,
     timeframe: str = "1h",
     limit: int = 1500,
+    include_taker_volume: bool = False,
 ) -> list:
     """
     Fetch historical OHLCV from Binance Futures.
     Returns list of [ts_ms, open, high, low, close, volume] — same format as ccxt.
     Paginates automatically for limit > 1000.
+
+    include_taker_volume: appends taker_buy_base_volume as a 7th column. Order-flow
+    signal (CVD proxy = taker_buy - taker_sell, where taker_sell = volume - taker_buy)
+    with the SAME retention as OHLCV/klines (200+ days) — unlike Binance's dedicated
+    futures/data/* stats endpoints (open interest, L/S ratio), which only keep ~30
+    days and error out on older startTime. Kept opt-in so existing callers that expect
+    the 6-column ccxt-compatible shape are unaffected.
     """
     sym      = _to_binance_symbol(symbol)
     interval = _INTERVAL_MAP.get(timeframe, "1h")
@@ -52,9 +60,14 @@ async def fetch_ohlcv_binance(
             if not raw:
                 break
 
-            # Binance returns: [open_time, open, high, low, close, volume, ...]
-            parsed = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])]
-                      for c in raw]
+            # Binance kline row: [open_time, open, high, low, close, volume,
+            # close_time, quote_volume, num_trades, taker_buy_base_volume, ...]
+            if include_taker_volume:
+                parsed = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]),
+                           float(c[5]), float(c[9])] for c in raw]
+            else:
+                parsed = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])]
+                          for c in raw]
 
             all_candles = parsed + all_candles
             remaining  -= len(parsed)
