@@ -109,20 +109,38 @@ class PairsTradingHarvester:
         # Execution-realism (2026-07-23, see project memory): each leg exits
         # on its own side (closing a long = sell, closing a short = buy) —
         # the two legs of a pair are NOT symmetric here, they're opposite.
-        async def _exit_price(symbol, price):
+        async def _exit_fill(symbol, price):
             pos = self.engine.positions.get(symbol)
             if pos is None:
-                return price
+                return price, 1.0
             exit_side = "sell" if pos.side == "long" else "buy"
-            fill_price, _amt, _info = await simulate_fill(client, symbol, exit_side, price, pos.amount)
-            return fill_price
+            fill_price, _fill_amount, fill_info = await simulate_fill(client, symbol, exit_side, price, pos.amount)
+            filled_pct = fill_info["filled_pct"] if fill_info["simulated"] else 1.0
+            return fill_price, filled_pct
 
-        exit_a, exit_b = await asyncio.gather(_exit_price(self.symbol_a, price_a), _exit_price(self.symbol_b, price_b))
-        rec_a = self.engine.close_position(self.symbol_a, exit_a, reason) if self.symbol_a in self.engine.positions else None
-        rec_b = self.engine.close_position(self.symbol_b, exit_b, reason) if self.symbol_b in self.engine.positions else None
+        (exit_a, filled_a), (exit_b, filled_b) = await asyncio.gather(
+            _exit_fill(self.symbol_a, price_a), _exit_fill(self.symbol_b, price_b))
+
+        def _close_leg(symbol, exit_price, filled_pct, reason):
+            # Bug fix (2026-07-23, found via DeepSeek code review of the
+            # same pattern in AutoTrader): a thin book can't always absorb
+            # the whole exit at the reported price — close only what
+            # actually filled rather than booking PnL for size that never
+            # traded there. Leaves any unfilled remainder open; the next
+            # cycle's liquidation check still watches it even though
+            # self.open_pair's z-score tracking is cleared below regardless.
+            if symbol not in self.engine.positions:
+                return None
+            if filled_pct < 0.999:
+                return self.engine.partial_close_position(symbol, exit_price, filled_pct, reason)
+            return self.engine.close_position(symbol, exit_price, reason)
+
+        rec_a = _close_leg(self.symbol_a, exit_a, filled_a, reason)
+        rec_b = _close_leg(self.symbol_b, exit_b, filled_b, reason)
         pnl_a = rec_a["pnl"] if rec_a else 0.0
         pnl_b = rec_b["pnl"] if rec_b else 0.0
-        self._log("TRADE", f"CLOSE PAIR ({reason}) z={self.last_z:.2f} | "
+        partial_tag = " (Teilfüllung, Rest bleibt offen)" if (filled_a < 0.999 or filled_b < 0.999) else ""
+        self._log("TRADE", f"CLOSE PAIR ({reason}) z={self.last_z:.2f}{partial_tag} | "
                             f"{self.symbol_a}={pnl_a:+.2f} {self.symbol_b}={pnl_b:+.2f} | total={pnl_a+pnl_b:+.2f}")
         get_journal().record("pairs_trading", f"{self.symbol_a}/{self.symbol_b}", "close_pair",
                               f"{reason}, z={self.last_z:.2f}", pnl=pnl_a + pnl_b)
@@ -154,8 +172,12 @@ class PairsTradingHarvester:
                     if sym in self.engine.positions and self.engine.check_sl_tp_liquidation(sym, price) == "liquidation":
                         pos = self.engine.positions.get(sym)
                         exit_side = "sell" if pos.side == "long" else "buy"
-                        exit_price, _amt, _info = await simulate_fill(client, sym, exit_side, price, pos.amount)
-                        self.engine.close_position(sym, exit_price, "liquidation")
+                        exit_price, _fill_amount, fill_info = await simulate_fill(client, sym, exit_side, price, pos.amount)
+                        filled_pct = fill_info["filled_pct"] if fill_info["simulated"] else 1.0
+                        if filled_pct < 0.999:
+                            self.engine.partial_close_position(sym, exit_price, filled_pct, "liquidation")
+                        else:
+                            self.engine.close_position(sym, exit_price, "liquidation")
                         self._log("ERROR", f"{sym} LIQUIDATED — Pair-Hedge gebrochen", sym)
                         self.open_pair = None
 
@@ -260,9 +282,15 @@ class PairsTradingHarvester:
                     # Leg B failed (e.g. insufficient margin) — don't leave leg A
                     # as a naked, unhedged directional bet.
                     exit_side_a = "sell" if side_a == "long" else "buy"
-                    exit_price_a, _amt, _info = await simulate_fill(client, self.symbol_a, exit_side_a, price_a, fill_amount_a)
-                    self.engine.close_position(self.symbol_a, exit_price_a, "hedge_leg_failed")
-                    self._log("ERROR", f"Leg B fehlgeschlagen ({e}), Leg A wieder geschlossen — kein ungehedgtes Bein")
+                    exit_price_a, _fill_amount, fill_info_a2 = await simulate_fill(client, self.symbol_a, exit_side_a, price_a, fill_amount_a)
+                    filled_pct_a = fill_info_a2["filled_pct"] if fill_info_a2["simulated"] else 1.0
+                    if filled_pct_a < 0.999:
+                        self.engine.partial_close_position(self.symbol_a, exit_price_a, filled_pct_a, "hedge_leg_failed")
+                        self._log("ERROR", f"Leg B fehlgeschlagen ({e}), Leg A nur {filled_pct_a:.0%} geschlossen (dünnes Orderbuch) "
+                                           f"— ungehedgter Rest bleibt offen, sofort prüfen!")
+                    else:
+                        self.engine.close_position(self.symbol_a, exit_price_a, "hedge_leg_failed")
+                        self._log("ERROR", f"Leg B fehlgeschlagen ({e}), Leg A wieder geschlossen — kein ungehedgtes Bein")
                     return
 
                 self.open_pair = {"direction": direction, "opened_bar": self._bar_count, "entry_z": z}

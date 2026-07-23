@@ -422,9 +422,16 @@ class AutoTrader:
                 elif trigger:
                     pos_d  = self.engine.get_position(symbol, price)
                     record = await self._close(symbol, price, trigger, client=client)
-                    self.thesis_manager.close_thesis(symbol)
+                    # _close() may have only partially filled (thin book) and
+                    # left a smaller remainder open — see its docstring. Only
+                    # do full-close cleanup (thesis, stale-cycle tracking)
+                    # when the position is actually gone.
+                    fully_closed = symbol not in self.engine.positions
+                    if fully_closed:
+                        self.thesis_manager.close_thesis(symbol)
+                    partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen)"
                     self._log("TRADE",
-                        f"{trigger.upper()} — closed {pos_d['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
+                        f"{trigger.upper()} — closed {pos_d['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%{partial_tag}",
                         symbol, {"type": trigger, **record})
                     return
 
@@ -461,11 +468,14 @@ class AutoTrader:
                         side_for_thesis = cur_pos_for_thesis.side if cur_pos_for_thesis else "?"
                         reason = f"thesis_{thesis_result['exit_reason']}"
                         record = await self._close(symbol, price, reason, client=client)
-                        self.thesis_manager.close_thesis(symbol)
-                        thesis_exit_happened = True
+                        fully_closed = symbol not in self.engine.positions
+                        if fully_closed:
+                            self.thesis_manager.close_thesis(symbol)
+                            thesis_exit_happened = True
+                        partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen, Thesis läuft weiter)"
                         self._log("TRADE",
                             f"THESIS EXIT ({thesis_result['exit_reason']}, belief={thesis_result['belief_score']:+.2f}) — "
-                            f"closed {side_for_thesis.upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
+                            f"closed {side_for_thesis.upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%{partial_tag}",
                             symbol, {"type": "thesis_exit", **record})
                         get_journal().record("autotrader", symbol, f"close_{side_for_thesis}",
                                               f"Thesis-Exit: {thesis_result['exit_reason']} (belief={thesis_result['belief_score']:+.2f})",
@@ -806,19 +816,25 @@ class AutoTrader:
 
             elif action == "close_long" and cur_pos and cur_pos.side == "long":
                 record = await self._close(symbol, price, close_reason, client=client)
-                self.position_stale_cycles.pop(symbol, None)
-                self.thesis_manager.close_thesis(symbol)
+                fully_closed = symbol not in self.engine.positions
+                if fully_closed:
+                    self.position_stale_cycles.pop(symbol, None)
+                    self.thesis_manager.close_thesis(symbol)
+                partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen)"
                 self._log("TRADE",
-                    f"CLOSE LONG ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
+                    f"CLOSE LONG ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%{partial_tag}",
                     symbol, {"type": "close_long", **record})
                 get_journal().record("autotrader", symbol, "close_long", close_reason, pnl=record["pnl"])
 
             elif action == "close_short" and cur_pos and cur_pos.side == "short":
                 record = await self._close(symbol, price, close_reason, client=client)
-                self.position_stale_cycles.pop(symbol, None)
-                self.thesis_manager.close_thesis(symbol)
+                fully_closed = symbol not in self.engine.positions
+                if fully_closed:
+                    self.position_stale_cycles.pop(symbol, None)
+                    self.thesis_manager.close_thesis(symbol)
+                partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen)"
                 self._log("TRADE",
-                    f"CLOSE SHORT ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
+                    f"CLOSE SHORT ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%{partial_tag}",
                     symbol, {"type": "close_short", **record})
                 get_journal().record("autotrader", symbol, "close_short", close_reason, pnl=record["pnl"])
 
@@ -865,9 +881,12 @@ class AutoTrader:
                             pos = self.engine.get_position(symbol, price)
                             async with FuturesClient() as mclient:
                                 record = await self._close(symbol, price, trigger, client=mclient)
-                            self.thesis_manager.close_thesis(symbol)
+                            fully_closed = symbol not in self.engine.positions
+                            if fully_closed:
+                                self.thesis_manager.close_thesis(symbol)
+                            partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen)"
                             self._log("TRADE",
-                                f"{trigger.upper()} (monitor) — closed {pos['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
+                                f"{trigger.upper()} (monitor) — closed {pos['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%{partial_tag}",
                                 symbol, {"type": trigger, **record})
                             get_journal().record("autotrader", symbol, f"close_{pos['side']}", trigger,
                                                   pnl=record["pnl"])
@@ -1050,7 +1069,19 @@ class AutoTrader:
         pos = self.engine.positions.get(symbol)
         if client is not None and pos is not None:
             exit_side = "sell" if pos.side == "long" else "buy"
-            price, _amt, _info = await simulate_fill(client, symbol, exit_side, price, pos.amount)
+            price, _fill_amount, fill_info = await simulate_fill(client, symbol, exit_side, price, pos.amount)
+            if fill_info["simulated"] and fill_info["filled_pct"] < 0.999:
+                # Bug fix (2026-07-23, found via DeepSeek code review): the
+                # book couldn't absorb the whole exit at this price — that
+                # price is only real for the portion that actually filled.
+                # Closing the FULL position at it would book "imaginary PnL"
+                # for the unfilled remainder. Close only what filled (same
+                # realistic degradation the open-side already gets), leave
+                # the rest open — a future cycle's SL/TP/signal/thesis check
+                # picks it back up like any other open position.
+                record = self.engine.partial_close_position(symbol, price, fill_info["filled_pct"], reason)
+                self.risk.daily_pnl += record["pnl"]
+                return record
         record = self.engine.close_position(symbol, price, reason=reason)
         self.risk.daily_pnl += record["pnl"]
         return record
@@ -1059,7 +1090,13 @@ class AutoTrader:
         pos = self.engine.positions.get(symbol)
         if client is not None and pos is not None:
             exit_side = "sell" if pos.side == "long" else "buy"
-            price, _amt, _info = await simulate_fill(client, symbol, exit_side, price, pos.amount * fraction)
+            price, _fill_amount, fill_info = await simulate_fill(client, symbol, exit_side, price, pos.amount * fraction)
+            if fill_info["simulated"] and fill_info["filled_pct"] < 0.999:
+                # Same fix as _close above, scaled to the requested fraction —
+                # if the book can only absorb part of even this partial exit,
+                # close proportionally less than asked rather than booking a
+                # price that wasn't really achievable for the full fraction.
+                fraction = fraction * fill_info["filled_pct"]
         record = self.engine.partial_close_position(symbol, price, fraction, reason)
         self.risk.daily_pnl += record["pnl"]
         return record

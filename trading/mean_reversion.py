@@ -148,12 +148,27 @@ class MeanReversionHarvester:
                     if trigger:
                         pos = self.engine.positions.get(symbol)
                         exit_price = price
+                        filled_pct = 1.0
                         if pos is not None:
                             exit_side = "sell" if pos.side == "long" else "buy"
-                            exit_price, _amt, _info = await simulate_fill(client, symbol, exit_side, price, pos.amount)
-                        record = self.engine.close_position(symbol, exit_price, trigger)
-                        self._log("TRADE", f"{trigger.upper()} closed @ {record['exit_price']:.4f} | "
-                                            f"net_pnl={record['pnl']:+.2f}", symbol)
+                            exit_price, _fill_amount, fill_info = await simulate_fill(client, symbol, exit_side, price, pos.amount)
+                            if fill_info["simulated"]:
+                                filled_pct = fill_info["filled_pct"]
+                        if filled_pct < 0.999:
+                            # Bug fix (2026-07-23, found via DeepSeek code
+                            # review of AutoTrader's version of this same
+                            # pattern): a thin book can't always absorb the
+                            # whole exit at the reported price — close only
+                            # what actually filled, leave the rest open,
+                            # rather than booking PnL for a size that never
+                            # traded at that price.
+                            record = self.engine.partial_close_position(symbol, exit_price, filled_pct, trigger)
+                            self._log("TRADE", f"{trigger.upper()} closed {filled_pct:.0%} @ {record['exit_price']:.4f} "
+                                                f"(nur teilgefüllt, Rest bleibt offen) | net_pnl={record['pnl']:+.2f}", symbol)
+                        else:
+                            record = self.engine.close_position(symbol, exit_price, trigger)
+                            self._log("TRADE", f"{trigger.upper()} closed @ {record['exit_price']:.4f} | "
+                                                f"net_pnl={record['pnl']:+.2f}", symbol)
                         get_journal().record("mean_reversion", symbol, "close", trigger, pnl=record["pnl"])
                         continue
 

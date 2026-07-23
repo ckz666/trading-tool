@@ -327,7 +327,19 @@ class FundingHarvester:
         """Execution-realism (2026-07-23, see project memory): closing this
         strategy's position is always sell spot + buy back perp (opposite of
         the always-long-spot/short-perp entry). Falls back to the naive
-        prices per-leg if either estimate fails."""
+        prices per-leg if either estimate fails.
+
+        Known gap (2026-07-23, found via DeepSeek code review of the same
+        partial-fill-on-exit bug in AutoTrader/Mean Reversion/Pairs Trading,
+        NOT fixed here): this discards each simulate_fill() call's
+        filled_pct, same underlying issue as those three had — but unlike
+        them, FundingHarvestEngine.close_position() has no partial-close
+        equivalent to fall back on (it always closes the full position),
+        so fixing this properly means adding that capability to the engine
+        itself, not just rewiring this call site. Deferred: this engine has
+        never actually opened a position all session (funding rates have
+        stayed below entry_rate_threshold throughout), so it's a real but
+        currently-inert gap, not an active bug like the other three were."""
         pos = self.engine.positions.get(symbol)
         if pos is None:
             return spot_price, perp_price
