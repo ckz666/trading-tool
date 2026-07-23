@@ -20,6 +20,7 @@ from trading.wallet import SharedWallet
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
 from trading.portfolio_risk import get_allocator as get_risk_allocator
+from trading.execution_sim import simulate_fill
 
 SPOT_FEE = 0.001        # 0.1% taker, matches trading/paper.py
 PERP_TAKER_FEE = 0.0006  # matches trading/futures_paper.py
@@ -322,6 +323,20 @@ class FundingHarvester:
         if level == "TRADE":
             notify_fire_and_forget(f"💰 <b>Funding Harvest</b> {tag}\n{msg}")
 
+    async def _exit_prices(self, spot_client, perp_client, symbol: str, spot_price: float, perp_price: float) -> tuple[float, float]:
+        """Execution-realism (2026-07-23, see project memory): closing this
+        strategy's position is always sell spot + buy back perp (opposite of
+        the always-long-spot/short-perp entry). Falls back to the naive
+        prices per-leg if either estimate fails."""
+        pos = self.engine.positions.get(symbol)
+        if pos is None:
+            return spot_price, perp_price
+        (fill_spot, _sa, _si), (fill_perp, _pa, _pi) = await asyncio.gather(
+            simulate_fill(spot_client, symbol, "sell", spot_price, pos.spot_qty),
+            simulate_fill(perp_client, symbol, "buy", perp_price, pos.perp_qty),
+        )
+        return fill_spot, fill_perp
+
     async def _cycle(self):
         self.cycle_count += 1
         prices_this_cycle: dict[str, dict] = {}
@@ -369,10 +384,29 @@ class FundingHarvester:
                         notional = min(self.engine.wallet.balance * max_position_pct,
                                         self.engine.wallet.balance * 0.9)
                         if notional > 50:  # dust guard
-                            record = self.engine.open_position(symbol, notional, spot_price, perp_price, self.leverage)
+                            # Execution-realism (2026-07-23, see project memory):
+                            # always long spot (buy) + short perp (sell) for this
+                            # strategy, both legs slippage-adjusted. Sized to the
+                            # WORSE-filled leg's filled_pct so the hedge stays
+                            # balanced — buying 100% of the spot notional but only
+                            # getting 80% filled on the perp leg would leave 20%
+                            # of the position unhedged.
+                            (fill_spot, _sa, info_spot), (fill_perp, _pa, info_perp) = await asyncio.gather(
+                                simulate_fill(spot, symbol, "buy", spot_price, notional / spot_price),
+                                simulate_fill(perp, symbol, "sell", perp_price, notional / perp_price),
+                            )
+                            worst_filled_pct = min(info_spot["filled_pct"], info_perp["filled_pct"])
+                            filled_notional = notional * worst_filled_pct
+                            if filled_notional <= 50:
+                                self._log("WARN", f"Zu dünnes Orderbuch für ${notional:.0f} Notional — Entry übersprungen", symbol)
+                                continue
+                            record = self.engine.open_position(symbol, filled_notional, fill_spot, fill_perp, self.leverage)
                             self._settlement_count[symbol] = 0
-                            self._log("TRADE", f"OPEN harvest ${notional:.0f} @ rate={rate*100:.4f}%/8h "
-                                               f"(~{rate*3*365*100:.1f}% APR) | basis={basis:.3f}%", symbol)
+                            slip_tag = ""
+                            if info_spot["simulated"] and (info_spot["slippage_pct"] > 0 or info_perp["slippage_pct"] > 0):
+                                slip_tag = f" | slip spot={info_spot['slippage_pct']:.2%} perp={info_perp['slippage_pct']:.2%}"
+                            self._log("TRADE", f"OPEN harvest ${filled_notional:.0f} @ rate={rate*100:.4f}%/8h "
+                                               f"(~{rate*3*365*100:.1f}% APR) | basis={basis:.3f}%{slip_tag}", symbol)
                             get_journal().record("funding_harvest", symbol, "open",
                                 f"Funding-Rate {rate*100:.4f}%/8h (~{rate*3*365*100:.1f}% APR) ≥ Schwelle "
                                 f"{self.entry_rate_threshold*100:.4f}%, Basis {basis:.3f}%")
@@ -381,12 +415,14 @@ class FundingHarvester:
                         # Liquidation and basis-blowout are genuine ongoing risks to the
                         # hedge itself — checked every poll, no reason to wait.
                         if self.engine.is_liquidated(symbol, perp_price):
-                            record = self.engine.close_position(symbol, spot_price, perp_price, "liquidation")
+                            exit_spot, exit_perp = await self._exit_prices(spot, perp, symbol, spot_price, perp_price)
+                            record = self.engine.close_position(symbol, exit_spot, exit_perp, "liquidation")
                             self._settlement_count.pop(symbol, None)
                             self._log("ERROR", f"LIQUIDATED — closed @ net_pnl={record['net_pnl']:+.2f}", symbol)
                             get_journal().record("funding_harvest", symbol, "close", "Liquidation", pnl=record["net_pnl"])
                         elif basis >= self.max_basis_pct:
-                            record = self.engine.close_position(symbol, spot_price, perp_price, "basis_risk")
+                            exit_spot, exit_perp = await self._exit_prices(spot, perp, symbol, spot_price, perp_price)
+                            record = self.engine.close_position(symbol, exit_spot, exit_perp, "basis_risk")
                             self._settlement_count.pop(symbol, None)
                             self._log("WARN", f"Basis {basis:.3f}% >= cap, closed @ net_pnl={record['net_pnl']:+.2f}", symbol)
                             get_journal().record("funding_harvest", symbol, "close",
@@ -414,7 +450,8 @@ class FundingHarvester:
                                 # is sunk either way, so bailing out early only locks in the
                                 # fee loss for certain instead of giving funding a chance to offset it.
                                 if settled >= self.min_hold_settlements and rate < self.exit_rate_threshold:
-                                    record = self.engine.close_position(symbol, spot_price, perp_price, "rate_dropped")
+                                    exit_spot, exit_perp = await self._exit_prices(spot, perp, symbol, spot_price, perp_price)
+                                    record = self.engine.close_position(symbol, exit_spot, exit_perp, "rate_dropped")
                                     self._settlement_count.pop(symbol, None)
                                     self._log("TRADE", f"CLOSE rate dropped to {rate*100:.4f}%/8h after "
                                                        f"{settled} settlements @ net_pnl={record['net_pnl']:+.2f}", symbol)

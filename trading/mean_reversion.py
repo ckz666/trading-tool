@@ -30,6 +30,7 @@ from ai.ml_signal import get_indicators
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
 from trading.portfolio_risk import get_allocator as get_risk_allocator
+from trading.execution_sim import simulate_fill
 
 MR_STATE_FILE = "data/mean_reversion_state.json"
 
@@ -121,8 +122,13 @@ class MeanReversionHarvester:
 
                     trigger = self.engine.check_sl_tp_liquidation(symbol, price)
                     if trigger:
-                        record = self.engine.close_position(symbol, price, trigger)
-                        self._log("TRADE", f"{trigger.upper()} closed @ {price:.4f} | "
+                        pos = self.engine.positions.get(symbol)
+                        exit_price = price
+                        if pos is not None:
+                            exit_side = "sell" if pos.side == "long" else "buy"
+                            exit_price, _amt, _info = await simulate_fill(client, symbol, exit_side, price, pos.amount)
+                        record = self.engine.close_position(symbol, exit_price, trigger)
+                        self._log("TRADE", f"{trigger.upper()} closed @ {record['exit_price']:.4f} | "
                                             f"net_pnl={record['pnl']:+.2f}", symbol)
                         get_journal().record("mean_reversion", symbol, "close", trigger, pnl=record["pnl"])
                         continue
@@ -160,12 +166,21 @@ class MeanReversionHarvester:
                     if amount * price / self.leverage < 10:   # dust guard
                         continue
 
+                    # Execution-realism (2026-07-23, see project memory): SL/TP
+                    # are recomputed off the actual fill price below.
+                    fill_side = "buy" if side == "long" else "sell"
+                    fill_price, fill_amount, fill_info = await simulate_fill(client, symbol, fill_side, price, amount)
+                    sl_dist_actual = sl_dist  # distance stays constant, just re-anchored to fill_price
+                    fill_sl = fill_price - sl_dist_actual if side == "long" else fill_price + sl_dist_actual
+                    fill_tp = fill_price + (tp - price) if side == "long" else fill_price - (price - tp)
                     record = self.engine.open_position(
-                        symbol, side, amount, price, self.leverage,
-                        stop_loss=sl, take_profit=tp, mode="mean_reversion",
+                        symbol, side, fill_amount, fill_price, self.leverage,
+                        stop_loss=fill_sl, take_profit=fill_tp, mode="mean_reversion",
                     )
-                    self._log("TRADE", f"OPEN {side.upper()} @ {price:.4f} | {reason} | "
-                                        f"SL={sl:.4f} TP={tp:.4f}", symbol)
+                    slip_tag = f" | slip {fill_info['slippage_pct']:.2%}" if fill_info["simulated"] and fill_info["slippage_pct"] > 0 else ""
+                    fill_tag = f" | filled {fill_info['filled_pct']:.0%}" if fill_info["filled_pct"] < 0.999 else ""
+                    self._log("TRADE", f"OPEN {side.upper()} @ {fill_price:.4f} | {reason} | "
+                                        f"SL={fill_sl:.4f} TP={fill_tp:.4f}{slip_tag}{fill_tag}", symbol)
                     get_journal().record("mean_reversion", symbol, f"open_{side}", reason)
                 except Exception as e:
                     self._log("ERROR", f"Cycle error: {e}", symbol)

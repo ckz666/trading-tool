@@ -61,6 +61,36 @@ class FuturesClient:
     async def fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
         return await self._exchange.fetch_order_book(to_futures_symbol(symbol), limit)
 
+    async def estimate_execution(self, symbol: str, side: str, notional_usdt: float,
+                                  max_levels: int = 20) -> dict | None:
+        """Walk the LIVE orderbook to estimate a realistic market-order fill
+        (2026-07-23, execution-realism round, see project memory) — the paper
+        engine used to fill every order instantly and completely at the last
+        ticker price, which is optimistic for anything beyond dust size,
+        especially on this bot's thinner small-cap symbols.
+
+        side: 'buy' (long entry / short exit — walks asks) or 'sell' (short
+        entry / long exit — walks bids).
+
+        Returns None on any fetch failure — caller falls back to the naive
+        ticker price rather than trading on a guess (same "don't silently
+        fake data" convention as fetch_funding_rate/fetch_current_oi).
+
+        Returns {"avg_price": weighted average fill price across levels,
+        "slippage_pct": abs distance from best price, "filled_pct": how much
+        of the requested notional the visible book depth could absorb (< 1.0
+        is a real partial-fill signal — the caller should size the position
+        down to match, not pretend it filled in full at a fantasy price),
+        "best_price": top-of-book price for reference}.
+        """
+        from trading.execution_sim import walk_orderbook
+        try:
+            ob = await self.fetch_order_book(symbol, limit=max_levels)
+        except Exception:
+            return None
+        levels = ob.get("asks") if side == "buy" else ob.get("bids")
+        return walk_orderbook(levels, notional_usdt)
+
     async def fetch_funding_rate(self, symbol: str) -> dict | None:
         """Returns None on failure — NOT a fake neutral rate. A prior version
         returned {"rate": 0.0001} on error, which is indistinguishable from a

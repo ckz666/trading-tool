@@ -29,6 +29,7 @@ from trading.futures_paper import FuturesPaperEngine
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
 from trading.portfolio_risk import get_allocator as get_risk_allocator
+from trading.execution_sim import simulate_fill
 
 PAIRS_STATE_FILE = "data/pairs_trading_state.json"
 
@@ -103,9 +104,21 @@ class PairsTradingHarvester:
         z = (s.iloc[-1] - mean) / std
         return float(z), float(std)
 
-    def _close_pair(self, price_a: float, price_b: float, reason: str):
-        rec_a = self.engine.close_position(self.symbol_a, price_a, reason) if self.symbol_a in self.engine.positions else None
-        rec_b = self.engine.close_position(self.symbol_b, price_b, reason) if self.symbol_b in self.engine.positions else None
+    async def _close_pair(self, client, price_a: float, price_b: float, reason: str):
+        # Execution-realism (2026-07-23, see project memory): each leg exits
+        # on its own side (closing a long = sell, closing a short = buy) —
+        # the two legs of a pair are NOT symmetric here, they're opposite.
+        async def _exit_price(symbol, price):
+            pos = self.engine.positions.get(symbol)
+            if pos is None:
+                return price
+            exit_side = "sell" if pos.side == "long" else "buy"
+            fill_price, _amt, _info = await simulate_fill(client, symbol, exit_side, price, pos.amount)
+            return fill_price
+
+        exit_a, exit_b = await asyncio.gather(_exit_price(self.symbol_a, price_a), _exit_price(self.symbol_b, price_b))
+        rec_a = self.engine.close_position(self.symbol_a, exit_a, reason) if self.symbol_a in self.engine.positions else None
+        rec_b = self.engine.close_position(self.symbol_b, exit_b, reason) if self.symbol_b in self.engine.positions else None
         pnl_a = rec_a["pnl"] if rec_a else 0.0
         pnl_b = rec_b["pnl"] if rec_b else 0.0
         self._log("TRADE", f"CLOSE PAIR ({reason}) z={self.last_z:.2f} | "
@@ -138,7 +151,10 @@ class PairsTradingHarvester:
                 # meant to be market-neutral — check it before anything else.
                 for sym, price in ((self.symbol_a, price_a), (self.symbol_b, price_b)):
                     if sym in self.engine.positions and self.engine.check_sl_tp_liquidation(sym, price) == "liquidation":
-                        self.engine.close_position(sym, price, "liquidation")
+                        pos = self.engine.positions.get(sym)
+                        exit_side = "sell" if pos.side == "long" else "buy"
+                        exit_price, _amt, _info = await simulate_fill(client, sym, exit_side, price, pos.amount)
+                        self.engine.close_position(sym, exit_price, "liquidation")
                         self._log("ERROR", f"{sym} LIQUIDATED — Pair-Hedge gebrochen", sym)
                         self.open_pair = None
 
@@ -158,7 +174,7 @@ class PairsTradingHarvester:
                         reason = "time_stop"
 
                     if reason:
-                        self._close_pair(price_a, price_b, reason)
+                        await self._close_pair(client, price_a, price_b, reason)
                     return   # one pair at a time — managed only while open
 
                 if abs(z) < self.z_entry:
@@ -207,30 +223,44 @@ class PairsTradingHarvester:
                 side_a = "long" if direction == "long_a_short_b" else "short"
                 side_b = "short" if direction == "long_a_short_b" else "long"
 
+                # Execution-realism (2026-07-23, see project memory): both legs
+                # get slippage-adjusted fills before sizing the wide backstop
+                # stops off them.
+                fill_side_a = "buy" if side_a == "long" else "sell"
+                fill_side_b = "buy" if side_b == "long" else "sell"
+                (fill_price_a, fill_amount_a, fill_info_a), (fill_price_b, fill_amount_b, fill_info_b) = await asyncio.gather(
+                    simulate_fill(client, self.symbol_a, fill_side_a, price_a, amount_a),
+                    simulate_fill(client, self.symbol_b, fill_side_b, price_b, amount_b),
+                )
+
                 # Wide backstop SL/TP per leg (15%) — the real exit is the z-score
                 # check above, this only guards against a leg going to zero while
                 # the other blows up (hedge failure / exchange-specific event).
                 def _wide_stops(price, side):
                     return ((price * 0.85, price * 1.15) if side == "long" else (price * 1.15, price * 0.85))
 
-                sl_a, tp_a = _wide_stops(price_a, side_a)
-                sl_b, tp_b = _wide_stops(price_b, side_b)
+                sl_a, tp_a = _wide_stops(fill_price_a, side_a)
+                sl_b, tp_b = _wide_stops(fill_price_b, side_b)
 
-                self.engine.open_position(self.symbol_a, side_a, amount_a, price_a, self.leverage,
+                self.engine.open_position(self.symbol_a, side_a, fill_amount_a, fill_price_a, self.leverage,
                                            stop_loss=sl_a, take_profit=tp_a, mode="pairs")
                 try:
-                    self.engine.open_position(self.symbol_b, side_b, amount_b, price_b, self.leverage,
+                    self.engine.open_position(self.symbol_b, side_b, fill_amount_b, fill_price_b, self.leverage,
                                                stop_loss=sl_b, take_profit=tp_b, mode="pairs")
                 except Exception as e:
                     # Leg B failed (e.g. insufficient margin) — don't leave leg A
                     # as a naked, unhedged directional bet.
-                    self.engine.close_position(self.symbol_a, price_a, "hedge_leg_failed")
+                    exit_side_a = "sell" if side_a == "long" else "buy"
+                    exit_price_a, _amt, _info = await simulate_fill(client, self.symbol_a, exit_side_a, price_a, fill_amount_a)
+                    self.engine.close_position(self.symbol_a, exit_price_a, "hedge_leg_failed")
                     self._log("ERROR", f"Leg B fehlgeschlagen ({e}), Leg A wieder geschlossen — kein ungehedgtes Bein")
                     return
 
                 self.open_pair = {"direction": direction, "opened_bar": self._bar_count, "entry_z": z}
+                slip_a = f" slip{fill_info_a['slippage_pct']:.2%}" if fill_info_a["simulated"] and fill_info_a["slippage_pct"] > 0 else ""
+                slip_b = f" slip{fill_info_b['slippage_pct']:.2%}" if fill_info_b["simulated"] and fill_info_b["slippage_pct"] > 0 else ""
                 self._log("TRADE", f"OPEN PAIR {direction} | z={z:.2f} std={std:.5f} | "
-                                    f"{self.symbol_a}={side_a}@{price_a:.2f} {self.symbol_b}={side_b}@{price_b:.2f}")
+                                    f"{self.symbol_a}={side_a}@{fill_price_a:.2f}{slip_a} {self.symbol_b}={side_b}@{fill_price_b:.2f}{slip_b}")
                 get_journal().record("pairs_trading", f"{self.symbol_a}/{self.symbol_b}", "open_pair",
                                       f"log-Spread z-Score {z:.2f} ≥ Entry-Schwelle {self.z_entry} — "
                                       f"{direction.replace('_', ' ')}")

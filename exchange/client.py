@@ -24,6 +24,19 @@ class BitgetClient:
     async def fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
         return await self._exchange.fetch_order_book(symbol, limit)
 
+    async def estimate_execution(self, symbol: str, side: str, notional_usdt: float,
+                                  max_levels: int = 20) -> dict | None:
+        """Spot-side counterpart to FuturesClient.estimate_execution() — see
+        its docstring (2026-07-23, execution-realism round, project memory).
+        Used by Funding Harvest's spot leg."""
+        from trading.execution_sim import walk_orderbook
+        try:
+            ob = await self.fetch_order_book(symbol, limit=max_levels)
+        except Exception:
+            return None
+        levels = ob.get("asks") if side == "buy" else ob.get("bids")
+        return walk_orderbook(levels, notional_usdt)
+
     async def fetch_balance(self) -> dict:
         if self.paper:
             raise RuntimeError("Use PaperEngine for paper balance")

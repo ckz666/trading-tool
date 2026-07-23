@@ -21,6 +21,7 @@ from ai.reddit_sentiment import fetch_reddit_sentiment
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
 from trading.portfolio_risk import get_allocator as get_risk_allocator
+from trading.execution_sim import simulate_fill
 
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "HYPE/USDT"]
 
@@ -395,20 +396,20 @@ class AutoTrader:
                 if trigger == "take_profit_1":
                     # Partial close 50% at TP1, move SL to breakeven
                     pos_d  = self.engine.get_position(symbol, price)
-                    record = self._partial_close(symbol, price, 0.5, "take_profit_1")
+                    record = await self._partial_close(symbol, price, 0.5, "take_profit_1", client=client)
                     # move SL to breakeven so the rest of the trade is risk-free
                     cur_pos = self.engine.positions.get(symbol)
                     if cur_pos:
                         cur_pos.stop_loss = cur_pos.entry_price
                     self._log("TRADE",
-                        f"PARTIAL TP1 — 50% geschlossen @ ${price:,.2f} | PnL: {record['pnl']:+.2f} USDT | SL → Breakeven ({cur_pos.entry_price:,.2f})",
+                        f"PARTIAL TP1 — 50% geschlossen @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | SL → Breakeven ({cur_pos.entry_price:,.2f})",
                         symbol, {"type": "take_profit_1", **record})
                     # continue to let the remaining position run (don't return)
                 elif trigger:
                     pos_d  = self.engine.get_position(symbol, price)
-                    record = self._close(symbol, price, trigger)
+                    record = await self._close(symbol, price, trigger, client=client)
                     self._log("TRADE",
-                        f"{trigger.upper()} — closed {pos_d['side'].upper()} @ ${price:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
+                        f"{trigger.upper()} — closed {pos_d['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
                         symbol, {"type": trigger, **record})
                     return
 
@@ -676,50 +677,64 @@ class AutoTrader:
 
             if action == "open_long" and not cur_pos:
                 self.position_stale_cycles[symbol] = 0
+                # Execution-realism (2026-07-23, see project memory): walk the
+                # live orderbook instead of assuming the whole order fills
+                # instantly at the last ticker price. SL/TP are recomputed off
+                # the ACTUAL fill price below, not the pre-slippage one — a
+                # percentage-based stop means relative to where you really
+                # got in, not where you wished you got in.
+                fill_price, fill_amount, fill_info = await simulate_fill(client, symbol, "buy", price, amount)
+                margin_use = (fill_amount * fill_price) / leverage
                 # Real per-symbol maintenance margin rate instead of a fixed 0.5%
                 # guess for every symbol (audit finding H-01, 2026-07-23, see
                 # project memory) — matters most for this bot's thinly-traded
                 # small-cap symbols, which can have meaningfully different tiers
                 # than BTC/ETH. Cached 1h, falls back to the old default on failure.
-                mmr = await client.fetch_maintenance_margin_rate(symbol, notional=amount * price)
+                mmr = await client.fetch_maintenance_margin_rate(symbol, notional=fill_amount * fill_price)
                 record = self.engine.open_position(
-                    symbol, "long", amount, price, leverage,
-                    price * (1 - sl_pct), price * (1 + tp_pct),
+                    symbol, "long", fill_amount, fill_price, leverage,
+                    fill_price * (1 - sl_pct), fill_price * (1 + tp_pct),
                     trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode,
                     maintenance_margin=mmr)
                 regime_tag = f" | {vol_regime['regime'].upper()}" if vol_regime["regime"] == "storm" else ""
+                slip_tag = f" | slip {fill_info['slippage_pct']:.2%}" if fill_info["simulated"] and fill_info["slippage_pct"] > 0 else ""
+                fill_tag = f" | filled {fill_info['filled_pct']:.0%}" if fill_info["filled_pct"] < 0.999 else ""
                 self._log("TRADE",
-                    f"OPEN {mode_tag}LONG {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag} | Liq ${record['liq_price']:,.0f}",
+                    f"OPEN {mode_tag}LONG {fill_amount:.6f} @ ${fill_price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag}{slip_tag}{fill_tag} | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_long", **record})
                 get_journal().record("autotrader", symbol, "open_long", reasoning)
 
             elif action == "open_short" and not cur_pos:
                 self.position_stale_cycles[symbol] = 0
-                mmr = await client.fetch_maintenance_margin_rate(symbol, notional=amount * price)
+                fill_price, fill_amount, fill_info = await simulate_fill(client, symbol, "sell", price, amount)
+                margin_use = (fill_amount * fill_price) / leverage
+                mmr = await client.fetch_maintenance_margin_rate(symbol, notional=fill_amount * fill_price)
                 record = self.engine.open_position(
-                    symbol, "short", amount, price, leverage,
-                    price * (1 + sl_pct), price * (1 - tp_pct),
+                    symbol, "short", fill_amount, fill_price, leverage,
+                    fill_price * (1 + sl_pct), fill_price * (1 - tp_pct),
                     trailing_sl=trailing_sl, trail_pct=trail_pct, mode=trade_mode,
                     maintenance_margin=mmr)
                 regime_tag = f" | {vol_regime['regime'].upper()}" if vol_regime["regime"] == "storm" else ""
+                slip_tag = f" | slip {fill_info['slippage_pct']:.2%}" if fill_info["simulated"] and fill_info["slippage_pct"] > 0 else ""
+                fill_tag = f" | filled {fill_info['filled_pct']:.0%}" if fill_info["filled_pct"] < 0.999 else ""
                 self._log("TRADE",
-                    f"OPEN {mode_tag}SHORT {amount:.6f} @ ${price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag} | Liq ${record['liq_price']:,.0f}",
+                    f"OPEN {mode_tag}SHORT {fill_amount:.6f} @ ${fill_price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag}{slip_tag}{fill_tag} | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_short", **record})
                 get_journal().record("autotrader", symbol, "open_short", reasoning)
 
             elif action == "close_long" and cur_pos and cur_pos.side == "long":
-                record = self._close(symbol, price, close_reason)
+                record = await self._close(symbol, price, close_reason, client=client)
                 self.position_stale_cycles.pop(symbol, None)
                 self._log("TRADE",
-                    f"CLOSE LONG ({close_reason}) @ ${price:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
+                    f"CLOSE LONG ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
                     symbol, {"type": "close_long", **record})
                 get_journal().record("autotrader", symbol, "close_long", close_reason, pnl=record["pnl"])
 
             elif action == "close_short" and cur_pos and cur_pos.side == "short":
-                record = self._close(symbol, price, close_reason)
+                record = await self._close(symbol, price, close_reason, client=client)
                 self.position_stale_cycles.pop(symbol, None)
                 self._log("TRADE",
-                    f"CLOSE SHORT ({close_reason}) @ ${price:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
+                    f"CLOSE SHORT ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
                     symbol, {"type": "close_short", **record})
                 get_journal().record("autotrader", symbol, "close_short", close_reason, pnl=record["pnl"])
 
@@ -747,21 +762,27 @@ class AutoTrader:
                     async with self._position_lock:
                         trigger = self.engine.check_sl_tp_liquidation(symbol, price)
                         if trigger == "take_profit_1":
-                            record = self._partial_close(symbol, price, 0.5, "take_profit_1")
+                            # Fresh client only when a trigger actually fires —
+                            # this loop polls every 15s but positions rarely
+                            # trigger, so a connection per iteration would be
+                            # wasteful; one per real close event is cheap.
+                            async with FuturesClient() as mclient:
+                                record = await self._partial_close(symbol, price, 0.5, "take_profit_1", client=mclient)
                             cur_pos = self.engine.positions.get(symbol)
                             if cur_pos:
                                 cur_pos.stop_loss = cur_pos.entry_price
                             self._log("TRADE",
-                                f"PARTIAL TP1 (monitor) — 50% @ ${price:,.2f} | PnL: {record['pnl']:+.2f} | SL → Breakeven",
+                                f"PARTIAL TP1 (monitor) — 50% @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} | SL → Breakeven",
                                 symbol, {"type": "take_profit_1", **record})
                             get_journal().record("autotrader", symbol, "partial_take_profit_1",
                                                   "TP1 @ 1.5x ATR erreicht, 50% geschlossen, SL auf Breakeven",
                                                   pnl=record["pnl"])
                         elif trigger:
                             pos = self.engine.get_position(symbol, price)
-                            record = self._close(symbol, price, trigger)
+                            async with FuturesClient() as mclient:
+                                record = await self._close(symbol, price, trigger, client=mclient)
                             self._log("TRADE",
-                                f"{trigger.upper()} (monitor) — closed {pos['side'].upper()} @ ${price:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
+                                f"{trigger.upper()} (monitor) — closed {pos['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
                                 symbol, {"type": trigger, **record})
                             get_journal().record("autotrader", symbol, f"close_{pos['side']}", trigger,
                                                   pnl=record["pnl"])
@@ -935,12 +956,25 @@ class AutoTrader:
         }
 
     # ── close helpers (always sync risk.daily_pnl) ───────────────────────────
-    def _close(self, symbol: str, price: float, reason: str) -> dict:
+    async def _close(self, symbol: str, price: float, reason: str, client=None) -> dict:
+        # Exit-side slippage (2026-07-23, see project memory): closing a long
+        # is a sell (walks bids), closing a short is a buy (walks asks) — the
+        # opposite side from opening. client=None (e.g. no orderbook client
+        # handy at this call site) falls back to the naive price, same
+        # graceful-degradation as simulate_fill's own internal fallback.
+        pos = self.engine.positions.get(symbol)
+        if client is not None and pos is not None:
+            exit_side = "sell" if pos.side == "long" else "buy"
+            price, _amt, _info = await simulate_fill(client, symbol, exit_side, price, pos.amount)
         record = self.engine.close_position(symbol, price, reason=reason)
         self.risk.daily_pnl += record["pnl"]
         return record
 
-    def _partial_close(self, symbol: str, price: float, fraction: float, reason: str) -> dict:
+    async def _partial_close(self, symbol: str, price: float, fraction: float, reason: str, client=None) -> dict:
+        pos = self.engine.positions.get(symbol)
+        if client is not None and pos is not None:
+            exit_side = "sell" if pos.side == "long" else "buy"
+            price, _amt, _info = await simulate_fill(client, symbol, exit_side, price, pos.amount * fraction)
         record = self.engine.partial_close_position(symbol, price, fraction, reason)
         self.risk.daily_pnl += record["pnl"]
         return record
