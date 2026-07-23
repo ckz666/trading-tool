@@ -29,6 +29,7 @@ from ai.whale import get_all_whale_data
 from exchange.market_scanner import get_trending_symbols, get_all_market_overview
 from trading.journal import get_journal
 from trading.metrics import compute_metrics
+from trading.portfolio_risk import get_allocator as get_risk_allocator
 
 
 # ── shared state ─────────────────────────────────────────────────────────────
@@ -166,6 +167,12 @@ async def _price_poll_loop():
                 engine = autotrader.engine if autotrader else futures_paper
                 engine.record_equity(prices)
                 _record_combined_equity()
+                get_risk_allocator().maybe_recompute({
+                    "autotrader":       futures_paper.equity_history,
+                    "funding_harvest":  funding_harvest_engine.equity_history,
+                    "mean_reversion":   mean_reversion_engine.equity_history,
+                    "pairs_trading":    pairs_trading_engine.equity_history,
+                })
 
                 # broadcast live position updates so frontend stays current
                 if autotrader and autotrader.engine.positions:
@@ -1040,6 +1047,15 @@ def portfolio_metrics():
         "mean_reversion": compute_metrics(mean_reversion_engine.equity_history),
         "pairs_trading": compute_metrics(pairs_trading_engine.equity_history),
     }
+
+
+@app.get("/api/portfolio/risk-allocation")
+def portfolio_risk_allocation():
+    """Current per-engine risk budget (risk_pct) from the portfolio-level
+    Kelly allocator — see trading/portfolio_risk.py. 'cold_start' mode means
+    fewer than 30 days of daily P&L history exist yet, so engines are sized
+    off their own variance only (no cross-engine correlation term)."""
+    return get_risk_allocator().status()
 
 
 @app.get("/api/reddit-sentiment/{symbol:path}")

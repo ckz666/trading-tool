@@ -20,6 +20,7 @@ from ai.cmc import fetch_cmc_data
 from ai.reddit_sentiment import fetch_reddit_sentiment
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
+from trading.portfolio_risk import get_allocator as get_risk_allocator
 
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "HYPE/USDT"]
 
@@ -650,6 +651,15 @@ class AutoTrader:
             risk_pct    = self._kelly_risk_pct(symbol)
             vol_regime  = classify_vol_regime(df)
             risk_pct    = risk_pct * vol_regime["risk_multiplier"]
+            # Portfolio-level Kelly allocator (2026-07-23, see project memory)
+            # as a CEILING, not a replacement — unlike the other three engines,
+            # AutoTrader's own per-symbol Kelly carries real information the
+            # allocator doesn't have (different symbols have different realised
+            # edge), so it stays the primary driver. The allocator's output
+            # caps it so a strong per-symbol Kelly result can't ignore the
+            # cross-engine portfolio budget it's now aware of.
+            portfolio_cap = get_risk_allocator().get_risk_pct("autotrader", default=risk_pct)
+            risk_pct    = min(risk_pct, portfolio_cap)
             risk_amount = equity * risk_pct
             sl_dist     = price * sl_pct         # stop-loss distance in USDT
             sl_dist     = max(sl_dist, price * 0.005)  # minimum 0.5%

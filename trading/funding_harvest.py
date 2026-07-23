@@ -19,6 +19,7 @@ from exchange.futures_client import FuturesClient
 from trading.wallet import SharedWallet
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
+from trading.portfolio_risk import get_allocator as get_risk_allocator
 
 SPOT_FEE = 0.001        # 0.1% taker, matches trading/paper.py
 PERP_TAKER_FEE = 0.0006  # matches trading/futures_paper.py
@@ -353,7 +354,19 @@ class FundingHarvester:
                         # size off free balance, not total equity — keeps sizing simple and
                         # avoids needing live prices for every other open position just to
                         # size this one entry
-                        notional = min(self.engine.wallet.balance * self.max_position_pct,
+                        # Portfolio-level Kelly allocator (2026-07-23, see project
+                        # memory) as a stand-in for max_position_pct — an
+                        # approximation, not a dimensionally exact match: the
+                        # allocator's risk_pct scale was derived assuming a
+                        # stop-loss-distance risk model (directional engines),
+                        # while this engine is delta-neutral with a different
+                        # risk shape (basis/liquidation risk, no SL distance).
+                        # Reusing the same budget scale is the minimal-change
+                        # choice DeepSeek's design called for rather than
+                        # building a second, harvest-specific allocator now.
+                        max_position_pct = get_risk_allocator().get_risk_pct(
+                            "funding_harvest", default=self.max_position_pct)
+                        notional = min(self.engine.wallet.balance * max_position_pct,
                                         self.engine.wallet.balance * 0.9)
                         if notional > 50:  # dust guard
                             record = self.engine.open_position(symbol, notional, spot_price, perp_price, self.leverage)

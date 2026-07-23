@@ -29,6 +29,7 @@ from trading.futures_paper import FuturesPaperEngine
 from ai.ml_signal import get_indicators
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
+from trading.portfolio_risk import get_allocator as get_risk_allocator
 
 MR_STATE_FILE = "data/mean_reversion_state.json"
 
@@ -144,7 +145,13 @@ class MeanReversionHarvester:
                     sl = price - atr * self.atr_sl_mult if side == "long" else price + atr * self.atr_sl_mult
                     tp = price + atr * self.atr_tp_mult if side == "long" else price - atr * self.atr_tp_mult
 
-                    risk_amount = equity * self.risk_pct
+                    # Portfolio-level Kelly allocator (2026-07-23, see project
+                    # memory) overrides the fixed constructor risk_pct once it
+                    # has enough data to size off — self.risk_pct is now only
+                    # the cold-start fallback used before that (and if the
+                    # allocator has no reading yet, e.g. right after boot).
+                    risk_pct = get_risk_allocator().get_risk_pct("mean_reversion", default=self.risk_pct)
+                    risk_amount = equity * risk_pct
                     sl_dist = max(abs(price - sl), price * 0.003)
                     raw_amount = risk_amount / sl_dist
                     remaining_margin_budget = equity * self.max_total_margin_pct - margin_used

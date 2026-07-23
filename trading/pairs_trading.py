@@ -28,6 +28,7 @@ from exchange.futures_client import FuturesClient
 from trading.futures_paper import FuturesPaperEngine
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
+from trading.portfolio_risk import get_allocator as get_risk_allocator
 
 PAIRS_STATE_FILE = "data/pairs_trading_state.json"
 
@@ -192,7 +193,10 @@ class PairsTradingHarvester:
                 sl_usdt = (self.z_stop - self.z_entry) * std * avg_price
                 if sl_usdt <= 0:
                     return
-                risk_amount = equity * self.risk_pct
+                # Portfolio-level Kelly allocator (2026-07-23, see project
+                # memory) — same override pattern as Mean Reversion.
+                risk_pct = get_risk_allocator().get_risk_pct("pairs_trading", default=self.risk_pct)
+                risk_amount = equity * risk_pct
                 notional_per_leg = risk_amount / (sl_usdt / avg_price)
                 remaining_budget = equity * self.max_total_margin_pct - margin_used
                 notional_per_leg = min(notional_per_leg, (remaining_budget * self.leverage) / 2)
