@@ -1197,9 +1197,23 @@ class AutoTrader:
             oi_break = sign * ctx.get("oi_delta", 0.0) < -0.05
             return price_broke and oi_break
 
+        # Counter-thesis registered TWICE, deliberately (2026-07-23, gap found
+        # via DeepSeek code review): once below as an EvidenceRule so a fired
+        # counter-thesis also contributes its own -3 to the belief score sum
+        # (DeepSeek's original formula: belief_score = Σ(rule × freshness)
+        # INCLUDING a named counter-thesis rule), and again further down as
+        # an InvalidationRule for the independent hard exit-trigger
+        # (ChatGPT's confirming refinement — invalidation isn't only "folded
+        # into" the score threshold). Same check function, two different
+        # roles — not a bug, both are needed for the agreed design.
+        counter_thesis_rule = EvidenceRule(
+            name="counter_thesis_confirmed", confirm_weight=0, contradict_weight=3, half_life_seconds=300,
+            check=lambda ctx: False if _counter_thesis(ctx) else None,
+        )
+
         return Thesis(
             symbol=symbol, engine="autotrader", direction=direction, reasoning=reasoning,
-            evidence_rules=[price_rule, oi_rule, orderflow_rule],
+            evidence_rules=[price_rule, oi_rule, orderflow_rule, counter_thesis_rule],
             invalidation_rules=[InvalidationRule(name="counter_thesis_confirmed", check=_counter_thesis)],
             entry_price=entry_price,
         )
