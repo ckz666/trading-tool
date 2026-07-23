@@ -26,6 +26,24 @@ P_TRANSITION = np.array([
 
 REGIME_RISK_MULTIPLIER = {"calm": 1.0, "storm": 0.5}
 
+# Continuous size modulator (2026-07-23, execution-realism round item #2, see
+# project memory — DeepSeek's deliberately cheap alternative to a full
+# regime-classifier/strategy-allocator: "ein simpler Vol-basierter Size-
+# Modulator (0.5-1.5x je Engine nach trailing Realized Vol) bringt 80% des
+# Nutzens günstiger"). Reuses prob_storm — already computed by the HMM
+# forward filter below, bimodality-guarded — as a smooth 0..1 dial instead
+# of only exposing the hard calm/storm switch AutoTrader already uses.
+# Deliberately a SEPARATE field (continuous_risk_multiplier) rather than
+# changing risk_multiplier itself: AutoTrader's sizing is already tuned
+# against the binary 0.5/1.0 switch, changing that number out from under it
+# would be an unintended behaviour change, not what was asked for here.
+CONTINUOUS_MULT_MAX = 1.5   # prob_storm == 0.0 (calmest observed)
+CONTINUOUS_MULT_MIN = 0.5   # prob_storm == 1.0 (stormiest observed)
+
+
+def _continuous_multiplier(prob_storm: float) -> float:
+    return CONTINUOUS_MULT_MAX - prob_storm * (CONTINUOUS_MULT_MAX - CONTINUOUS_MULT_MIN)
+
 
 def _fit_two_clusters(x: np.ndarray, iters: int = 15) -> tuple[float, float, float, float]:
     """Cheap 1D 2-means split with per-cluster std — stand-in for Gaussian-mixture
@@ -78,17 +96,17 @@ def classify_vol_regime(df: pd.DataFrame, vol_window: int = 24, lookback: int = 
     vol_window: bars used for the rolling realised-vol measure (24 ≈ 1 day on 1h candles).
     lookback: how much history to use for fitting the two emission clusters.
 
-    Returns {"regime", "prob_storm", "risk_multiplier"}, or a calm/neutral
-    default if there isn't enough data yet.
+    Returns {"regime", "prob_storm", "risk_multiplier", "continuous_risk_multiplier"},
+    or a calm/neutral default if there isn't enough data yet.
     """
     if len(df) < vol_window + 30:
-        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0}
+        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0, "continuous_risk_multiplier": CONTINUOUS_MULT_MAX}
 
     returns = df["close"].pct_change()
     realised_vol = returns.rolling(vol_window).std().dropna()
     window = realised_vol.iloc[-lookback:]
     if len(window) < 30:
-        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0}
+        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0, "continuous_risk_multiplier": CONTINUOUS_MULT_MAX}
 
     x = window.to_numpy()
 
@@ -102,7 +120,7 @@ def classify_vol_regime(df: pd.DataFrame, vol_window: int = 24, lookback: int = 
     # instead of the forced split, so a genuinely unimodal window is
     # rejected before it ever reaches the clustering step.
     if _bimodality_coefficient(x) < 0.6:
-        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0}
+        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0, "continuous_risk_multiplier": CONTINUOUS_MULT_MAX}
 
     calm_mean, calm_std, storm_mean, storm_std = _fit_two_clusters(x)
     if storm_mean < calm_mean:
@@ -126,6 +144,7 @@ def classify_vol_regime(df: pd.DataFrame, vol_window: int = 24, lookback: int = 
         "regime": regime,
         "prob_storm": round(prob_storm, 3),
         "risk_multiplier": REGIME_RISK_MULTIPLIER[regime],
+        "continuous_risk_multiplier": round(_continuous_multiplier(prob_storm), 3),
     }
 
 

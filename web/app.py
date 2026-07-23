@@ -691,6 +691,7 @@ class MeanReversionStartRequest(BaseModel):
     risk_pct: float = 0.005
     leverage: int = 3
     max_total_margin_pct: float = 0.20
+    oi_delta_threshold: float = 0.03
 
 
 @app.post("/api/mean-reversion/start")
@@ -714,6 +715,7 @@ async def start_mean_reversion(req: MeanReversionStartRequest):
             risk_pct=req.risk_pct,
             leverage=req.leverage,
             max_total_margin_pct=req.max_total_margin_pct,
+            oi_delta_threshold=req.oi_delta_threshold,
         )
         mean_reversion_harvester.start()
         return {"status": "started"}

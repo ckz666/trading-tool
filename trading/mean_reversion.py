@@ -27,6 +27,7 @@ import pandas as pd
 from exchange.futures_client import FuturesClient
 from trading.futures_paper import FuturesPaperEngine
 from ai.ml_signal import get_indicators
+from ai.vol_regime import classify_vol_regime
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
 from trading.portfolio_risk import get_allocator as get_risk_allocator
@@ -62,6 +63,7 @@ class MeanReversionHarvester:
         risk_pct: float = 0.005,      # 0.5% of engine equity per trade
         leverage: int = 3,
         max_total_margin_pct: float = 0.20,   # cap: total MR margin as % of engine equity
+        oi_delta_threshold: float = 0.03,     # OI-filter add-on (2026-07-23, see class docstring)
     ):
         self.symbols = symbols or ["BTC/USDT", "ETH/USDT"]
         self.engine = engine or FuturesPaperEngine(state_file=MR_STATE_FILE)
@@ -76,12 +78,24 @@ class MeanReversionHarvester:
         self.risk_pct = risk_pct
         self.leverage = leverage
         self.max_total_margin_pct = max_total_margin_pct
+        self.oi_delta_threshold = oi_delta_threshold
 
         self.running = False
         self._task: Optional[asyncio.Task] = None
         self.cycle_count = 0
         self.log: list[dict] = []
         self.live_prices: dict[str, float] = {}
+        # OI-filter add-on (2026-07-23, execution-realism round item #2, see
+        # project memory — DeepSeek's minimal-change recommendation instead
+        # of a standalone OI/deleveraging-reversion engine): "Mean-Reversion
+        # nur bei starkem Mean-Reversion-Signal UND niedrigem OI-Delta" — a
+        # rolling ~20min OI buffer per symbol, same pattern as AutoTrader's
+        # own _oi_buffer. Rationale: if open interest is moving a lot, new
+        # leveraged positions are actively building up — that's evidence FOR
+        # a developing trend, which directly contradicts the range-bound
+        # thesis this engine trades on, even if RSI/Bollinger/ADX still look
+        # like a valid mean-reversion setup in isolation.
+        self._oi_buffer: dict[str, list] = {}
 
     def _log(self, level: str, msg: str, symbol: str = None):
         entry = {"ts": datetime.now().isoformat(), "level": level, "symbol": symbol or "ALL", "msg": msg}
@@ -120,6 +134,16 @@ class MeanReversionHarvester:
                     price = float(df["close"].iloc[-1])
                     self.live_prices[symbol] = price
 
+                    # OI buffer: always update, whether or not a signal fires
+                    # this cycle, so the delta is available the moment one
+                    # does — same accumulate-every-cycle pattern as AutoTrader.
+                    oi_now = await client.fetch_current_oi(symbol)
+                    oi_buf = self._oi_buffer.setdefault(symbol, [])
+                    if oi_now:
+                        oi_buf.append(oi_now)
+                        if len(oi_buf) > 12:   # ~1h at this engine's default 5min cycle
+                            oi_buf.pop(0)
+
                     trigger = self.engine.check_sl_tp_liquidation(symbol, price)
                     if trigger:
                         pos = self.engine.positions.get(symbol)
@@ -141,6 +165,19 @@ class MeanReversionHarvester:
                     if label == "hold":
                         continue
 
+                    # OI filter (2026-07-23, see __init__ docstring for the
+                    # full reasoning): only need >= 4 samples (~20min) for a
+                    # first delta read — a symbol with a fresh/empty buffer
+                    # just hasn't accumulated enough history yet, not
+                    # evidence of anything, so it's allowed through rather
+                    # than blocked by default.
+                    if len(oi_buf) >= 4 and oi_buf[0] > 0:
+                        oi_delta = (oi_buf[-1] - oi_buf[0]) / oi_buf[0]
+                        if abs(oi_delta) > self.oi_delta_threshold:
+                            self._log("INFO", f"OI-Filter: Δ{oi_delta:+.1%} über Schwelle "
+                                              f"{self.oi_delta_threshold:.0%} — Setup übersprungen (Trend baut sich auf)", symbol)
+                            continue
+
                     equity = self._engine_equity()
                     margin_used = sum(p.margin for p in self.engine.positions.values())
                     if margin_used >= equity * self.max_total_margin_pct:
@@ -157,6 +194,15 @@ class MeanReversionHarvester:
                     # the cold-start fallback used before that (and if the
                     # allocator has no reading yet, e.g. right after boot).
                     risk_pct = get_risk_allocator().get_risk_pct("mean_reversion", default=self.risk_pct)
+                    # Vol-size modulator (2026-07-23, execution-realism round
+                    # item #2, see project memory) — DeepSeek's cheap
+                    # alternative to a full regime classifier: scale size
+                    # 0.5x-1.5x by trailing realised volatility. Not redundant
+                    # with the ADX<20 ranging gate above — a market can be
+                    # low-ADX (no trend) but still choppy/high-vol, or
+                    # low-ADX and genuinely calm; this adds that second axis.
+                    vol_regime = classify_vol_regime(df)
+                    risk_pct = risk_pct * vol_regime["continuous_risk_multiplier"]
                     risk_amount = equity * risk_pct
                     sl_dist = max(abs(price - sl), price * 0.003)
                     raw_amount = risk_amount / sl_dist
@@ -179,8 +225,9 @@ class MeanReversionHarvester:
                     )
                     slip_tag = f" | slip {fill_info['slippage_pct']:.2%}" if fill_info["simulated"] and fill_info["slippage_pct"] > 0 else ""
                     fill_tag = f" | filled {fill_info['filled_pct']:.0%}" if fill_info["filled_pct"] < 0.999 else ""
+                    vol_tag = f" | vol×{vol_regime['continuous_risk_multiplier']:.2f}"
                     self._log("TRADE", f"OPEN {side.upper()} @ {fill_price:.4f} | {reason} | "
-                                        f"SL={fill_sl:.4f} TP={fill_tp:.4f}{slip_tag}{fill_tag}", symbol)
+                                        f"SL={fill_sl:.4f} TP={fill_tp:.4f}{slip_tag}{fill_tag}{vol_tag}", symbol)
                     get_journal().record("mean_reversion", symbol, f"open_{side}", reason)
                 except Exception as e:
                     self._log("ERROR", f"Cycle error: {e}", symbol)
@@ -229,6 +276,7 @@ class MeanReversionHarvester:
             "risk_pct": self.risk_pct,
             "leverage": self.leverage,
             "max_total_margin_pct": self.max_total_margin_pct,
+            "oi_delta_threshold": self.oi_delta_threshold,
             "cycle_count": self.cycle_count,
             "engine": self.engine.status(self.live_prices),
         }

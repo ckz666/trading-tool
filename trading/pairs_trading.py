@@ -30,6 +30,7 @@ from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
 from trading.portfolio_risk import get_allocator as get_risk_allocator
 from trading.execution_sim import simulate_fill
+from ai.vol_regime import classify_vol_regime
 
 PAIRS_STATE_FILE = "data/pairs_trading_state.json"
 
@@ -212,6 +213,14 @@ class PairsTradingHarvester:
                 # Portfolio-level Kelly allocator (2026-07-23, see project
                 # memory) — same override pattern as Mean Reversion.
                 risk_pct = get_risk_allocator().get_risk_pct("pairs_trading", default=self.risk_pct)
+                # Vol-size modulator (2026-07-23, execution-realism round item
+                # #2, see project memory) — applied off symbol_b (the more
+                # liquid/representative "market" leg, e.g. BTC) as a proxy for
+                # general market stress: spreads and correlations both tend to
+                # get less reliable when the wider market is turbulent, even
+                # though the pair itself is directionally market-neutral.
+                vol_regime = classify_vol_regime(df_b)
+                risk_pct = risk_pct * vol_regime["continuous_risk_multiplier"]
                 risk_amount = equity * risk_pct
                 notional_per_leg = risk_amount / (sl_usdt / avg_price)
                 remaining_budget = equity * self.max_total_margin_pct - margin_used
@@ -259,7 +268,7 @@ class PairsTradingHarvester:
                 self.open_pair = {"direction": direction, "opened_bar": self._bar_count, "entry_z": z}
                 slip_a = f" slip{fill_info_a['slippage_pct']:.2%}" if fill_info_a["simulated"] and fill_info_a["slippage_pct"] > 0 else ""
                 slip_b = f" slip{fill_info_b['slippage_pct']:.2%}" if fill_info_b["simulated"] and fill_info_b["slippage_pct"] > 0 else ""
-                self._log("TRADE", f"OPEN PAIR {direction} | z={z:.2f} std={std:.5f} | "
+                self._log("TRADE", f"OPEN PAIR {direction} | z={z:.2f} std={std:.5f} | vol×{vol_regime['continuous_risk_multiplier']:.2f} | "
                                     f"{self.symbol_a}={side_a}@{fill_price_a:.2f}{slip_a} {self.symbol_b}={side_b}@{fill_price_b:.2f}{slip_b}")
                 get_journal().record("pairs_trading", f"{self.symbol_a}/{self.symbol_b}", "open_pair",
                                       f"log-Spread z-Score {z:.2f} ≥ Entry-Schwelle {self.z_entry} — "
