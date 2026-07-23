@@ -714,8 +714,24 @@ class AutoTrader:
             # edge), so it stays the primary driver. The allocator's output
             # caps it so a strong per-symbol Kelly result can't ignore the
             # cross-engine portfolio budget it's now aware of.
-            portfolio_cap = get_risk_allocator().get_risk_pct("autotrader", default=risk_pct)
-            risk_pct    = min(risk_pct, portfolio_cap)
+            #
+            # Bug fix (2026-07-23, found via DeepSeek code review): during
+            # cold_start (the allocator's actual state for its first ~30 days
+            # — every engine's history is too short for a real correlation
+            # read), the "ceiling" was silently squashing AutoTrader down to
+            # the same MIN_ENGINE_PCT floor (0.2%) as engines with literally
+            # zero track record — a 5-10x cut from its usual Kelly-derived
+            # 1-2%, not a mild ceiling. That defeats the entire point of NOT
+            # replacing AutoTrader's sizing: it has real per-symbol signal
+            # the allocator doesn't, and the allocator has nothing yet to
+            # meaningfully override it WITH during cold_start. Only apply the
+            # cap once the allocator has graduated to "correlated" mode (real
+            # cross-engine data) — before that, AutoTrader's own Kelly stands
+            # on its own, same as it always did before this feature existed.
+            allocator = get_risk_allocator()
+            if allocator.status()["mode"] == "correlated":
+                portfolio_cap = allocator.get_risk_pct("autotrader", default=risk_pct)
+                risk_pct = min(risk_pct, portfolio_cap)
             risk_amount = equity * risk_pct
             sl_dist     = price * sl_pct         # stop-loss distance in USDT
             sl_dist     = max(sl_dist, price * 0.005)  # minimum 0.5%

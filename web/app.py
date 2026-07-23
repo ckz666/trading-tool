@@ -575,10 +575,19 @@ async def retrain_model(limit: int = 1000):
 
 @app.get("/api/autotrader/positions")
 def get_positions():
-    engine = autotrader.engine if autotrader else futures_paper
+    # Delegates to AutoTrader.get_open_positions() when it's running — that's
+    # the version with belief_score attached (2026-07-23, see project memory
+    # and trading/thesis_manager.py; this endpoint used to duplicate the
+    # position-dict-building logic itself, which silently meant the belief
+    # score field never actually reached the frontend despite existing in
+    # the engine-level method — a real bug the user caught live). Falls back
+    # to the plain futures_paper engine (no thesis manager) when AutoTrader
+    # isn't running at all.
+    if autotrader:
+        return autotrader.get_open_positions()
     prices = {sym: d["price"] for sym, d in _price_cache.items()}
     result = []
-    for sym, pos in engine.positions.items():
+    for sym, pos in futures_paper.positions.items():
         p = prices.get(sym, pos.entry_price)
         d = pos.to_dict(p)
         d["current_price"] = p

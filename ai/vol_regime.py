@@ -39,6 +39,7 @@ REGIME_RISK_MULTIPLIER = {"calm": 1.0, "storm": 0.5}
 # would be an unintended behaviour change, not what was asked for here.
 CONTINUOUS_MULT_MAX = 1.5   # prob_storm == 0.0 (calmest observed)
 CONTINUOUS_MULT_MIN = 0.5   # prob_storm == 1.0 (stormiest observed)
+CONTINUOUS_MULT_NEUTRAL = 1.0   # "we don't know" — see bug note below, NOT CONTINUOUS_MULT_MAX
 
 
 def _continuous_multiplier(prob_storm: float) -> float:
@@ -100,13 +101,13 @@ def classify_vol_regime(df: pd.DataFrame, vol_window: int = 24, lookback: int = 
     or a calm/neutral default if there isn't enough data yet.
     """
     if len(df) < vol_window + 30:
-        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0, "continuous_risk_multiplier": CONTINUOUS_MULT_MAX}
+        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0, "continuous_risk_multiplier": CONTINUOUS_MULT_NEUTRAL}
 
     returns = df["close"].pct_change()
     realised_vol = returns.rolling(vol_window).std().dropna()
     window = realised_vol.iloc[-lookback:]
     if len(window) < 30:
-        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0, "continuous_risk_multiplier": CONTINUOUS_MULT_MAX}
+        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0, "continuous_risk_multiplier": CONTINUOUS_MULT_NEUTRAL}
 
     x = window.to_numpy()
 
@@ -120,7 +121,7 @@ def classify_vol_regime(df: pd.DataFrame, vol_window: int = 24, lookback: int = 
     # instead of the forced split, so a genuinely unimodal window is
     # rejected before it ever reaches the clustering step.
     if _bimodality_coefficient(x) < 0.6:
-        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0, "continuous_risk_multiplier": CONTINUOUS_MULT_MAX}
+        return {"regime": "calm", "prob_storm": 0.0, "risk_multiplier": 1.0, "continuous_risk_multiplier": CONTINUOUS_MULT_NEUTRAL}
 
     calm_mean, calm_std, storm_mean, storm_std = _fit_two_clusters(x)
     if storm_mean < calm_mean:
