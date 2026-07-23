@@ -110,6 +110,31 @@ nav {
 .stat .lbl { font-size: 10px; color: var(--muted); font-weight: 600; margin-bottom: 4px; letter-spacing: 0.3px; }
 .stat .val { font-size: 16px; font-weight: 700; color: var(--text); }
 
+/* ── Help bubble (hover/tap tooltip) ──
+   Tooltip is a single shared #hb-tooltip element positioned via JS with
+   position:fixed (see bottom of file) rather than a CSS ::after on each
+   icon — a pure-CSS absolutely-positioned tooltip gets silently clipped by
+   any ancestor with overflow:auto (every table here sits in one for
+   horizontal scroll), which showed up as just a sliver of its background
+   instead of the text. position:fixed escapes that clipping entirely. */
+.hb {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 13px; height: 13px; border-radius: 50%; margin-left: 4px;
+  background: var(--border); color: var(--muted);
+  font-size: 9px; font-weight: 700; font-style: normal;
+  cursor: help; vertical-align: middle;
+}
+.hb:hover, .hb:focus { background: var(--blue); color: #fff; }
+#hb-tooltip {
+  position: fixed; background: var(--text); color: var(--bg2);
+  padding: 6px 9px; border-radius: 6px; font-size: 11px; font-weight: 500;
+  letter-spacing: normal; white-space: normal; max-width: 220px;
+  line-height: 1.4; box-shadow: var(--shadow);
+  opacity: 0; pointer-events: none; transition: opacity 0.12s;
+  z-index: 999;
+}
+#hb-tooltip.show { opacity: 1; }
+
 /* ── Tables ── */
 .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 table { width: 100%; border-collapse: collapse; min-width: 500px; }
@@ -325,9 +350,9 @@ button:disabled { opacity: 0.4; cursor: default; }
     <div class="card">
       <div class="card-title">Gesamt-Portfolio</div>
       <div class="stats">
-        <div class="stat"><div class="lbl">Gesamtwert</div><div class="val" id="pt-total">—</div></div>
-        <div class="stat"><div class="lbl">Gesamt-PnL</div><div class="val" id="pt-pnl">—</div></div>
-        <div class="stat"><div class="lbl">Freies Guthaben</div><div class="val" id="pt-balance">—</div></div>
+        <div class="stat"><div class="lbl">Gesamtwert<i class="hb" tabindex="0" data-tip="Freies Guthaben + Wert aller offenen Positionen über alle vier Engines zusammen (AutoTrader, Funding Harvest, Mean Reversion, Pairs Trading).">?</i></div><div class="val" id="pt-total">—</div></div>
+        <div class="stat"><div class="lbl">Gesamt-PnL<i class="hb" tabindex="0" data-tip="Gesamtwert minus Start-Kapital — realisiert und unrealisiert zusammen, über alle Engines.">?</i></div><div class="val" id="pt-pnl">—</div></div>
+        <div class="stat"><div class="lbl">Freies Guthaben<i class="hb" tabindex="0" data-tip="Cash im Shared Wallet, das gerade in keiner offenen Position gebunden ist.">?</i></div><div class="val" id="pt-balance">—</div></div>
         <div class="stat"><div class="lbl">Start-Kapital</div><div class="val" id="pt-initial">—</div></div>
       </div>
       <div id="pt-valuation-warn" style="display:none; margin-top:10px; padding:8px 10px; border-radius:6px; background:var(--yellow-bg,rgba(230,180,50,0.12)); color:var(--yellow); font-size:12px;"></div>
@@ -348,16 +373,16 @@ button:disabled { opacity: 0.4; cursor: default; }
     <div class="card">
       <div class="card-title">Risiko-Kennzahlen (Gesamt-Portfolio)</div>
       <div class="stats" style="margin-bottom:0">
-        <div class="stat"><div class="lbl">Sharpe Ratio</div><div class="val" id="pm-sharpe">—</div></div>
-        <div class="stat"><div class="lbl">Max Drawdown</div><div class="val" id="pm-maxdd">—</div></div>
-        <div class="stat"><div class="lbl">Return (Verlauf)</div><div class="val" id="pm-return">—</div></div>
-        <div class="stat"><div class="lbl">Datenpunkte</div><div class="val" id="pm-samples">—</div></div>
+        <div class="stat"><div class="lbl">Sharpe Ratio<i class="hb" tabindex="0" data-tip="Risikoadjustierte Rendite, hochgerechnet aufs Jahr. Bei wenigen Datenpunkten (siehe rechts) extrem instabil — erst ab einigen hundert Punkten aussagekräftig.">?</i></div><div class="val" id="pm-sharpe">—</div></div>
+        <div class="stat"><div class="lbl">Max Drawdown<i class="hb" tabindex="0" data-tip="Größter bisheriger Rückgang vom Höchststand des Gesamt-Portfolios, seit dieser Verlauf aufgezeichnet wird.">?</i></div><div class="val" id="pm-maxdd">—</div></div>
+        <div class="stat"><div class="lbl">Return (Verlauf)<i class="hb" tabindex="0" data-tip="Veränderung des Portfoliowerts vom ersten bis zum letzten aufgezeichneten Datenpunkt — nicht seit Gesamtstart, siehe Gesamt-PnL dafür.">?</i></div><div class="val" id="pm-return">—</div></div>
+        <div class="stat"><div class="lbl">Datenpunkte<i class="hb" tabindex="0" data-tip="Anzahl aufgezeichneter Equity-Messpunkte, aus denen Sharpe/Drawdown berechnet werden. Wenig Punkte = wenig verlässlich.">?</i></div><div class="val" id="pm-samples">—</div></div>
       </div>
     </div>
 
     <!-- Trade Journal (letzte Einträge) -->
     <div class="card" style="grid-column: 1 / -1;">
-      <div class="card-title">Trade Journal — letzte Entscheidungen</div>
+      <div class="card-title">Trade Journal — letzte Entscheidungen<i class="hb" tabindex="0" data-tip="Zentrales Protokoll aller vier Engines mit Klartext-Begründung pro Trade (Confluence-Kriterien, RSI/ADX-Werte, Z-Score, Funding-Rate, ...) — bleibt auch über Neustarts hinweg erhalten.">?</i></div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Zeit</th><th>Engine</th><th>Symbol</th><th>Aktion</th><th>Begründung</th><th>PnL</th></tr></thead>
@@ -432,7 +457,9 @@ button:disabled { opacity: 0.4; cursor: default; }
       <table>
         <thead><tr>
           <th>Symbol</th><th>Side</th><th>Größe</th><th>Entry</th><th>Aktuell</th>
-          <th>Lev.</th><th>Liq.</th><th>SL</th><th>TP</th><th>uPnL</th><th>ROE</th><th>Seit</th>
+          <th>Lev.</th><th>Liq.</th><th>SL</th><th>TP</th>
+          <th>Netto P&L<i class="hb" tabindex="0" data-tip="Preis-PnL minus Entry-Fee, geschätzter Exit-Fee und bisher gezahltem Funding — was beim Schließen jetzt tatsächlich übrig bliebe, nicht nur die reine Kursbewegung.">?</i></th>
+          <th>ROE</th><th>Seit</th>
         </tr></thead>
         <tbody id="positions-body"><tr class="empty-row"><td colspan="12">Keine offenen Positionen</td></tr></tbody>
       </table>
@@ -477,7 +504,7 @@ button:disabled { opacity: 0.4; cursor: default; }
           <input id="at-min-conf" type="number" value="0.55" min="0.40" max="0.99" step="0.05"></div>
         <div class="fg"><label>Min. ML-Conf</label>
           <input id="at-min-ml-conf" type="number" value="0.35" min="0.20" max="0.80" step="0.05"></div>
-        <div class="fg"><label>Min. Confluence</label>
+        <div class="fg"><label>Min. Confluence<i class="hb" tabindex="0" data-tip="Score aus bis zu 27 Kriterien (Ichimoku, Market Structure, News, CMC, Reddit, OI/CVD, Funding, ...). Trade nur wenn der Score dieser Schwelle entspricht.">?</i></label>
           <input id="at-min-confluence" type="number" value="9" min="1" max="27" step="1"></div>
       </div>
 
@@ -708,8 +735,12 @@ button:disabled { opacity: 0.4; cursor: default; }
     <div style="overflow-x:auto;">
       <table>
         <thead><tr>
-          <th>Symbol</th><th>Notional</th><th>Hebel</th><th>Basis</th>
-          <th>Funding verdient</th><th>Preis-P&L</th><th>Netto P&L</th><th>Eröffnet</th>
+          <th>Symbol</th><th>Notional</th><th>Hebel</th>
+          <th>Basis<i class="hb" tabindex="0" data-tip="Abweichung zwischen Spot- und Perp-Preis in %. Steigt sie zu stark, läuft der Hedge auseinander und die Position wird geschlossen.">?</i></th>
+          <th>Funding verdient</th>
+          <th>Preis-P&L<i class="hb" tabindex="0" data-tip="Spot- und Perp-Bein sollen sich preislich etwa ausgleichen (marktneutral) — was hier übrig bleibt ist Basis-Drift, nicht Richtungsgewinn.">?</i></th>
+          <th>Netto P&L<i class="hb" tabindex="0" data-tip="Funding verdient + Preis-P&L minus Gebühren — die eigentliche Ertragsquelle dieser Strategie ist das Funding, nicht der Preis.">?</i></th>
+          <th>Eröffnet</th>
         </tr></thead>
         <tbody id="fh-positions-body"><tr class="empty-row"><td colspan="8">Keine offenen Positionen</td></tr></tbody>
       </table>
@@ -863,7 +894,9 @@ button:disabled { opacity: 0.4; cursor: default; }
       <table>
         <thead><tr>
           <th>Symbol</th><th>Seite</th><th>Entry</th><th>Aktuell</th>
-          <th>SL</th><th>TP</th><th>Netto P&L</th><th>ROE</th>
+          <th>SL</th><th>TP</th>
+          <th>Netto P&L<i class="hb" tabindex="0" data-tip="Preis-PnL minus Entry-Fee, geschätzter Exit-Fee und Funding — was beim Schließen jetzt tatsächlich übrig bliebe.">?</i></th>
+          <th>ROE</th>
         </tr></thead>
         <tbody id="mr-positions-body"><tr class="empty-row"><td colspan="8">Keine offenen Positionen</td></tr></tbody>
       </table>
@@ -936,7 +969,7 @@ button:disabled { opacity: 0.4; cursor: default; }
         <div class="stat"><div class="lbl">Balance</div><div class="val" id="pr-balance">—</div></div>
         <div class="stat"><div class="lbl">Portfolio</div><div class="val" id="pr-portfolio">—</div></div>
         <div class="stat"><div class="lbl">PnL (live)</div><div class="val" id="pr-pnl-live">—</div></div>
-        <div class="stat"><div class="lbl">Aktueller Z-Score</div><div class="val" id="pr-last-z">—</div></div>
+        <div class="stat"><div class="lbl">Aktueller Z-Score<i class="hb" tabindex="0" data-tip="Wie viele Standardabweichungen der log(ETH/BTC)-Spread gerade vom rollierenden Mittel abweicht. Ab ±Entry-Schwelle wird eröffnet, bei Rückkehr zu 0 geschlossen.">?</i></div><div class="val" id="pr-last-z">—</div></div>
       </div>
       <div id="pr-pair-status" style="font-size:12px;color:var(--muted);"></div>
     </div>
@@ -948,7 +981,9 @@ button:disabled { opacity: 0.4; cursor: default; }
     <div style="overflow-x:auto;">
       <table>
         <thead><tr>
-          <th>Symbol</th><th>Seite</th><th>Entry</th><th>Aktuell</th><th>Netto P&L</th><th>ROE</th>
+          <th>Symbol</th><th>Seite</th><th>Entry</th><th>Aktuell</th>
+          <th>Netto P&L<i class="hb" tabindex="0" data-tip="Preis-PnL minus Entry-Fee, geschätzter Exit-Fee und Funding. Beide Beine zusammen ergeben das Gesamtergebnis des Pairs — ein Bein allein ist keine sinnvolle Kennzahl.">?</i></th>
+          <th>ROE</th>
         </tr></thead>
         <tbody id="pr-positions-body"><tr class="empty-row"><td colspan="6">Keine offenen Positionen</td></tr></tbody>
       </table>
@@ -1868,6 +1903,31 @@ async function refreshJournal() {
 }
 refreshJournal();
 setInterval(refreshJournal, 20000);
+
+// ── Help bubble tooltips (position:fixed, escapes overflow:auto table wraps) ──
+(function() {
+  const tip = document.createElement('div');
+  tip.id = 'hb-tooltip';
+  document.body.appendChild(tip);
+  function showTip(el) {
+    tip.textContent = el.getAttribute('data-tip') || '';
+    tip.classList.add('show');
+    tip.style.left = '0px'; tip.style.top = '0px';
+    const r = el.getBoundingClientRect();
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    let left = r.left + r.width / 2 - tw / 2;
+    left = Math.max(6, Math.min(left, window.innerWidth - tw - 6));
+    let top = r.top - th - 8;
+    if (top < 6) top = r.bottom + 8;   // flip below the icon if no room above
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+  }
+  function hideTip() { tip.classList.remove('show'); }
+  document.addEventListener('mouseover', e => { const hb = e.target.closest('.hb'); if (hb) showTip(hb); });
+  document.addEventListener('mouseout',  e => { const hb = e.target.closest('.hb'); if (hb) hideTip(); });
+  document.addEventListener('focusin',   e => { const hb = e.target.closest('.hb'); if (hb) showTip(hb); });
+  document.addEventListener('focusout',  e => { const hb = e.target.closest('.hb'); if (hb) hideTip(); });
+})();
 
 // ── Funding Harvest ────────────────────────────────────────────────────────
 async function startFundingHarvest() {

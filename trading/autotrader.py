@@ -18,7 +18,6 @@ from ai.vol_regime import classify_vol_regime
 from ai.whale import fetch_news_sentiment
 from ai.cmc import fetch_cmc_data
 from ai.reddit_sentiment import fetch_reddit_sentiment
-from exchange.liquidation_stream import get_collector as get_liquidation_collector
 from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
 
@@ -324,10 +323,6 @@ class AutoTrader:
                 _safe_news_cmc(),
                 _safe_reddit(),
             )
-            # Liquidation flow: read-only from the always-running background
-            # WebSocket collector (exchange/liquidation_stream.py) — no network
-            # call here, so no caching needed, unlike the fetch-based sources above.
-            liq_flow = get_liquidation_collector().flow_score(symbol, window_hours=1.0)
 
             # ── OI buffer: accumulate per-cycle snapshots, compute deltas ──
             buf = self._oi_buffer.setdefault(symbol, [])
@@ -380,11 +375,6 @@ class AutoTrader:
                 market_sentiment["reddit_bias"] = reddit.get("bias", "neutral")
                 market_sentiment["reddit_bull"] = reddit.get("bull_mentions", 0)
                 market_sentiment["reddit_bear"] = reddit.get("bear_mentions", 0)
-            if liq_flow.get("available"):
-                market_sentiment["liq_dominant_side"] = liq_flow.get("dominant_side")
-                market_sentiment["liq_dominance_ratio"] = liq_flow.get("dominance_ratio", 1.0)
-                market_sentiment["liq_long_usd"] = liq_flow.get("long_liq_usd", 0)
-                market_sentiment["liq_short_usd"] = liq_flow.get("short_liq_usd", 0)
             df     = _to_df(ohlcv)
             df_4h  = _to_df(ohlcv_4h)
             df_1d  = _to_df(ohlcv_1d)
@@ -511,7 +501,7 @@ class AutoTrader:
 
             self._log("INFO",
                 f"ML → {label.upper()} conf={conf:.2f} | DI={di_score:.2f} | "
-                f"C_long={score_long} C_short={score_short}/28",
+                f"C_long={score_long} C_short={score_short}/27",
                 symbol)
 
             action = "hold"
@@ -566,7 +556,7 @@ class AutoTrader:
                 label_direction = "long" if label == "buy" else ("short" if label == "sell" else None)
 
                 if best < eff_min:
-                    skip_reason = f"C={best}/28 < {eff_min}" + (" (ML=hold — höhere Hürde)" if ml_was_hold else "")
+                    skip_reason = f"C={best}/27 < {eff_min}" + (" (ML=hold — höhere Hürde)" if ml_was_hold else "")
                 elif abs(score_long - score_short) < self.neutral_zone:
                     skip_reason = f"Neutralzone |{score_long}-{score_short}| < {self.neutral_zone}"
                 elif self.skip_contra and label_direction and entry_direction != label_direction:
@@ -639,11 +629,11 @@ class AutoTrader:
             reasons_str = " | ".join(confluence_reasons[:4])
             mode_tag = "SCALP " if trade_mode == "scalp" else ""
             self._log("INFO",
-                f"SIGNAL {mode_tag}{action.upper()} | C={confluence_score}/28 | conf={conf:.2f} | SL={sl_pct:.1%} TP={tp_pct:.1%} | {reasons_str}",
+                f"SIGNAL {mode_tag}{action.upper()} | C={confluence_score}/27 | conf={conf:.2f} | SL={sl_pct:.1%} TP={tp_pct:.1%} | {reasons_str}",
                 symbol)
 
             reasoning = (reasons_str if trade_mode == "scalp" else
-                         f"Rule: C={confluence_score}/28 ≥ {MIN_CONFLUENCE}. {reasons_str}")
+                         f"Rule: C={confluence_score}/27 ≥ {MIN_CONFLUENCE}. {reasons_str}")
             decision = {
                 "action": action, "confidence": conf, "mode": trade_mode,
                 "reasoning": reasoning,
@@ -1253,23 +1243,6 @@ class AutoTrader:
                 score += 1; reasons.append(f"Reddit bullisch ({sentiment.get('reddit_bull',0)}↑/{sentiment.get('reddit_bear',0)}↓)")
             elif reddit_bias == "bearish" and not is_long:
                 score += 1; reasons.append(f"Reddit bärisch ({sentiment.get('reddit_bull',0)}↑/{sentiment.get('reddit_bear',0)}↓)")
-
-            # 20. Liquidation flow (Binance forceOrder stream, free, no API key —
-            # see exchange/liquidation_stream.py; NOT a Coinglass price-level
-            # heatmap, that needs a $699+/mo Coinglass plan, checked 2026-07-23,
-            # no free tier despite an earlier assumption otherwise). Interpreted
-            # as momentum confirmation, not a contrarian "magnet" signal: heavy
-            # recent SHORT liquidations = a squeeze = bullish momentum; heavy
-            # recent LONG liquidations = a flush = bearish momentum. Only counts
-            # when the dominant side's liquidation volume is at least 1.5x the
-            # other side's (dominance_ratio) — otherwise it's just noise.
-            liq_side = sentiment.get("liq_dominant_side")
-            liq_ratio = sentiment.get("liq_dominance_ratio", 1.0)
-            if liq_side and liq_ratio >= 1.5:
-                if liq_side == "short" and is_long:
-                    score += 1; reasons.append(f"Short-Squeeze-Flow (${sentiment.get('liq_short_usd',0):,.0f} liquidiert, {liq_ratio:.1f}x)")
-                elif liq_side == "long" and not is_long:
-                    score += 1; reasons.append(f"Long-Flush-Flow (${sentiment.get('liq_long_usd',0):,.0f} liquidiert, {liq_ratio:.1f}x)")
 
         # No clamp-to-0 here (unlike the old single-direction version) — this gets
         # compared against the opposite direction's score via argmax in _run_symbol,

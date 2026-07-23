@@ -27,7 +27,6 @@ from strategies.base import STRATEGIES
 from monitoring.alerts import AlertManager
 from ai.whale import get_all_whale_data
 from exchange.market_scanner import get_trending_symbols, get_all_market_overview
-from exchange.liquidation_stream import get_collector as get_liquidation_collector
 from trading.journal import get_journal
 from trading.metrics import compute_metrics
 
@@ -64,10 +63,8 @@ COMBINED_EQUITY_FILE = "data/combined_equity_history.json"
 async def lifespan(app: FastAPI):
     _load_combined_equity_history()
     task = asyncio.create_task(_price_poll_loop())
-    get_liquidation_collector().start()
     yield
     task.cancel()
-    await get_liquidation_collector().stop()
 
 
 app = FastAPI(title="Bitget Trading Tool", lifespan=lifespan)
@@ -1043,14 +1040,6 @@ def portfolio_metrics():
         "mean_reversion": compute_metrics(mean_reversion_engine.equity_history),
         "pairs_trading": compute_metrics(pairs_trading_engine.equity_history),
     }
-
-
-@app.get("/api/liquidation-flow/{symbol:path}")
-def liquidation_flow(symbol: str, window_hours: float = 1.0):
-    """Free real-time liquidation flow (Binance forceOrder stream, no API key)
-    — see exchange/liquidation_stream.py for why this isn't a Coinglass-style
-    price-level heatmap (that needs a paid $699+/mo plan)."""
-    return get_liquidation_collector().flow_score(symbol, window_hours=window_hours)
 
 
 @app.get("/api/reddit-sentiment/{symbol:path}")
