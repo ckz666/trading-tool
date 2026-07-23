@@ -427,28 +427,46 @@ class AutoTrader:
             # supports the trade (or a specific invalidation condition fired),
             # exit now rather than waiting for a fresh directional signal to
             # eventually flip and trigger a normal close_long/close_short.
-            if symbol in self.engine.positions:
-                thesis_ctx = {
-                    "price": price,
-                    "entry_price": self.engine.positions[symbol].entry_price,
-                    "oi_delta": market_sentiment.get("oi_4h_delta", 0.0),
-                    "cvd_ratio": market_sentiment.get("cvd_ratio", 0.5),
-                }
-                thesis_result = self.thesis_manager.evaluate(symbol, thesis_ctx)
-                if thesis_result and thesis_result["exit"]:
-                    cur_pos_for_thesis = self.engine.positions.get(symbol)
-                    side_for_thesis = cur_pos_for_thesis.side if cur_pos_for_thesis else "?"
-                    reason = f"thesis_{thesis_result['exit_reason']}"
-                    record = await self._close(symbol, price, reason, client=client)
-                    self.thesis_manager.close_thesis(symbol)
-                    self._log("TRADE",
-                        f"THESIS EXIT ({thesis_result['exit_reason']}, belief={thesis_result['belief_score']:+.2f}) — "
-                        f"closed {side_for_thesis.upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
-                        symbol, {"type": "thesis_exit", **record})
-                    get_journal().record("autotrader", symbol, f"close_{side_for_thesis}",
-                                          f"Thesis-Exit: {thesis_result['exit_reason']} (belief={thesis_result['belief_score']:+.2f})",
-                                          pnl=record["pnl"])
-                    return
+            #
+            # Race-condition fix (2026-07-23, found via DeepSeek code review):
+            # this block used to sit OUTSIDE self._position_lock while the
+            # fast _monitor_loop's SL/TP checks run INSIDE it every 15s — the
+            # two could race to close the same position concurrently (this
+            # coroutine awaits inside simulate_fill/close, during which the
+            # monitor loop can run and close the position first), and the
+            # second close() call would hit close_position()'s "No open
+            # position" ValueError. Wrapping in the same lock the monitor
+            # loop already holds during its own close serializes the two.
+            thesis_exit_happened = False
+            async with self._position_lock:
+                if symbol in self.engine.positions:
+                    thesis_ctx = {
+                        "price": price,
+                        "entry_price": self.engine.positions[symbol].entry_price,
+                        "oi_delta": market_sentiment.get("oi_4h_delta", 0.0),
+                        "cvd_ratio": market_sentiment.get("cvd_ratio", 0.5),
+                    }
+                    thesis_result = self.thesis_manager.evaluate(symbol, thesis_ctx)
+                    if thesis_result and thesis_result["exit"]:
+                        cur_pos_for_thesis = self.engine.positions.get(symbol)
+                        side_for_thesis = cur_pos_for_thesis.side if cur_pos_for_thesis else "?"
+                        reason = f"thesis_{thesis_result['exit_reason']}"
+                        record = await self._close(symbol, price, reason, client=client)
+                        self.thesis_manager.close_thesis(symbol)
+                        thesis_exit_happened = True
+                        self._log("TRADE",
+                            f"THESIS EXIT ({thesis_result['exit_reason']}, belief={thesis_result['belief_score']:+.2f}) — "
+                            f"closed {side_for_thesis.upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
+                            symbol, {"type": "thesis_exit", **record})
+                        get_journal().record("autotrader", symbol, f"close_{side_for_thesis}",
+                                              f"Thesis-Exit: {thesis_result['exit_reason']} (belief={thesis_result['belief_score']:+.2f})",
+                                              pnl=record["pnl"])
+            if thesis_exit_happened:
+                # Same convention as the hard SL/TP trigger above: skip this
+                # cycle's fresh signal/decision logic for a symbol that was
+                # just closed, rather than potentially whipsawing straight
+                # into a new entry in the same cycle.
+                return
 
             # ── risk checks (daily loss + drawdown) ──
             # Deliberately the TRUE cross-engine equity when available (see
