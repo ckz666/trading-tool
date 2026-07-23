@@ -35,8 +35,25 @@ as the proof of concept — it already has the richest per-cycle data (price,
 OI buffer, CVD) needed for meaningful evidence rules with the least new
 plumbing. The other three engines are a documented follow-up, not done
 here.
+
+Persistence (2026-07-23, added after the user caught a real position's
+belief_score showing empty post-restart — thesis state was pure in-memory,
+so every service restart silently dropped exit protection for whatever was
+open at the time): EvidenceRule/InvalidationRule carry executable check()
+closures, which aren't JSON-serialisable — but the closures themselves are
+pure functions of `direction` (AutoTrader._build_thesis(symbol, direction,
+entry_price, reasoning) rebuilds an identical rule set from those four
+plain values every time). So only the DATA needs persisting — symbol,
+direction, entry_price, reasoning, and the evidence log (rule name/value/
+timestamp) — and on load, ThesisManager calls back into the engine-supplied
+rebuild_fn to reconstruct fresh Thesis objects with live rule closures,
+then replays the saved evidence log into them. Same tmp-then-rename atomic
+write pattern as every other state file in this project (wallet, risk
+state, journal, ...) — no new persistence mechanism introduced.
 """
+import json
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional
@@ -132,26 +149,101 @@ class Thesis:
             "exit_reason": invalidated_by or ("belief_negative" if belief < 0 else None),
         }
 
+    def to_dict(self) -> dict:
+        """Data only — see module docstring for why the rule objects
+        themselves (executable closures) aren't part of this."""
+        return {
+            "symbol": self.symbol,
+            "engine": self.engine,
+            "direction": self.direction,
+            "reasoning": self.reasoning,
+            "entry_price": self.entry_price,
+            "created_at": self.created_at.isoformat(),
+            "last_belief_score": self.last_belief_score,
+            "readings": [
+                {"rule_name": r.rule_name, "value": r.value, "ts": r.ts.isoformat()}
+                for r in self._readings
+            ],
+        }
+
+    def restore_readings(self, readings: list[dict]):
+        """Replay a saved evidence log onto a freshly-rebuilt Thesis (same
+        rule set, reconstructed via the engine's rebuild function — see
+        ThesisManager.load()). Readings older than any rule's half_life by
+        enough to be functionally zero are skipped rather than kept forever,
+        same effect freshness decay would have had if the process had never
+        restarted."""
+        for r in readings:
+            try:
+                ts = datetime.fromisoformat(r["ts"])
+            except (KeyError, ValueError):
+                continue
+            self._readings.append(_EvidenceReading(rule_name=r["rule_name"], value=r["value"], ts=ts))
+        self._compute_belief()
+
 
 class ThesisManager:
     """One per engine instance — tracks at most one open thesis per symbol,
     mirroring how these engines already track at most one open position per
-    symbol."""
+    symbol.
 
-    def __init__(self):
+    state_file/rebuild_fn: optional — pass both to persist across restarts.
+    rebuild_fn(symbol, direction, entry_price, reasoning) -> Thesis must
+    return a thesis with the SAME rule set _build_thesis would create fresh
+    (it's how load() reconstructs live rule closures from saved plain
+    data). Omit both to get the old pure-in-memory behaviour (e.g. for unit
+    tests that don't want file I/O)."""
+
+    def __init__(self, state_file: str = None, rebuild_fn: Callable = None):
         self._theses: dict[str, Thesis] = {}
+        self.state_file = state_file
+        self.rebuild_fn = rebuild_fn
+        if state_file and rebuild_fn:
+            self._load()
+
+    def _save(self):
+        if not self.state_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            data = {sym: t.to_dict() for sym, t in self._theses.items()}
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            print(f"[ThesisManager] Could not save state: {e}")
+
+    def _load(self):
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file) as f:
+                data = json.load(f)
+            for sym, d in data.items():
+                thesis = self.rebuild_fn(sym, d["direction"], d["entry_price"], d["reasoning"])
+                thesis.created_at = datetime.fromisoformat(d["created_at"])
+                thesis.restore_readings(d.get("readings", []))
+                self._theses[sym] = thesis
+            print(f"[ThesisManager:{self.state_file}] Restored {len(self._theses)} open thesis/theses")
+        except Exception as e:
+            print(f"[ThesisManager:{self.state_file}] Could not load state: {e} — starting fresh")
 
     def open_thesis(self, thesis: Thesis):
         self._theses[thesis.symbol] = thesis
+        self._save()
 
     def get(self, symbol: str) -> Optional[Thesis]:
         return self._theses.get(symbol)
 
     def close_thesis(self, symbol: str):
         self._theses.pop(symbol, None)
+        self._save()
 
     def evaluate(self, symbol: str, context: dict) -> Optional[dict]:
         thesis = self._theses.get(symbol)
         if thesis is None:
             return None
-        return thesis.evaluate(context)
+        result = thesis.evaluate(context)
+        self._save()
+        return result

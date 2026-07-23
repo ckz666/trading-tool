@@ -152,7 +152,16 @@ class AutoTrader:
         # Dynamic Exit & Belief Manager (2026-07-23, execution-realism round
         # item #3, DeepSeek+ChatGPT design, see project memory / trading/
         # thesis_manager.py) — V1, wired into AutoTrader only.
-        self.thesis_manager = ThesisManager()
+        self.thesis_manager = ThesisManager(
+            state_file="data/autotrader_thesis_state.json", rebuild_fn=self._build_thesis)
+        # Reconciliation: drop any restored thesis whose position isn't
+        # actually open (state files can drift out of sync with each other
+        # across a crash or manual edit) — a thesis with no matching position
+        # would just sit unused forever otherwise, since it's only ever
+        # cleaned up via the normal close-position code paths.
+        for sym in list(self.thesis_manager._theses.keys()):
+            if sym not in self.engine.positions:
+                self.thesis_manager.close_thesis(sym)
         # News/CMC/Fear&Greed change on a macro timescale, not per 5-min cycle —
         # cached per symbol to avoid hammering RSS feeds and burning CMC's rate-
         # limited free-tier API credits every single cycle for every symbol.
