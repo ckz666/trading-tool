@@ -645,9 +645,11 @@ button:disabled { opacity: 0.4; cursor: default; }
           <th>Symbol</th><th>Side</th><th>Größe</th><th>Entry</th><th>Aktuell</th>
           <th>Lev.</th><th>Liq.</th><th>SL</th><th>TP</th>
           <th>Netto P&L<i class="hb" tabindex="0" data-tip="Preis-PnL minus Entry-Fee, geschätzter Exit-Fee und bisher gezahltem Funding — was beim Schließen jetzt tatsächlich übrig bliebe, nicht nur die reine Kursbewegung.">?</i></th>
-          <th>ROE</th><th>Seit</th>
+          <th>ROE</th>
+          <th>Belief<i class="hb" tabindex="0" data-tip="Dynamic Exit & Belief Manager: laufend neu berechnete Zustimmung zur Entry-These aus Preis/OI/Orderflow-Evidenz, zeitgewichtet. Unter 0 oder eine harte Gegenthese-Bedingung schließt die Position automatisch.">?</i></th>
+          <th>Seit</th>
         </tr></thead>
-        <tbody id="positions-body"><tr class="empty-row"><td colspan="12">Keine offenen Positionen</td></tr></tbody>
+        <tbody id="positions-body"><tr class="empty-row"><td colspan="13">Keine offenen Positionen</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1805,7 +1807,7 @@ function renderPositions(positions) {
   const tbody = document.getElementById('positions-body');
   set('pos-count', positions.length);
   if (!positions.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="12">Keine offenen Positionen</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="13">Keine offenen Positionen</td></tr>';
     return;
   }
   tbody.innerHTML = '';
@@ -1833,6 +1835,7 @@ function renderPositions(positions) {
       <td style="color:var(--green)">$${fmt(p.take_profit)}</td>
       <td style="color:${pc};font-weight:700">${pnlStr(pnl,' USDT')}</td>
       <td style="color:${pc};font-weight:700">${roe>=0?'+':''}${roe.toFixed(1)}%</td>
+      <td style="color:${p.belief_score==null?'var(--muted)':pnlColor(p.belief_score)};font-weight:600">${p.belief_score==null?'—':(p.belief_score>=0?'+':'')+p.belief_score.toFixed(2)}</td>
       <td class="muted">${fmtTime(p.opened_at)}</td>
     `;
     tbody.appendChild(row);

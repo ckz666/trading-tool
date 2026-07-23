@@ -22,6 +22,7 @@ from notifications.telegram import notify_fire_and_forget
 from trading.journal import get_journal
 from trading.portfolio_risk import get_allocator as get_risk_allocator
 from trading.execution_sim import simulate_fill
+from trading.thesis_manager import ThesisManager, Thesis, EvidenceRule, InvalidationRule
 
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "HYPE/USDT"]
 
@@ -148,6 +149,10 @@ class AutoTrader:
         self.last_symbol_refresh: str = None
         self._oi_buffer: dict[str, list] = {}         # {symbol: [oi_float, ...]} rolling 300 entries
         self._cvd_ratio_buffer: dict[str, list] = {}  # {symbol: [cvd_ratio, ...]} rolling 100 entries, see use_cvd_feature
+        # Dynamic Exit & Belief Manager (2026-07-23, execution-realism round
+        # item #3, DeepSeek+ChatGPT design, see project memory / trading/
+        # thesis_manager.py) — V1, wired into AutoTrader only.
+        self.thesis_manager = ThesisManager()
         # News/CMC/Fear&Greed change on a macro timescale, not per 5-min cycle —
         # cached per symbol to avoid hammering RSS feeds and burning CMC's rate-
         # limited free-tier API credits every single cycle for every symbol.
@@ -408,9 +413,41 @@ class AutoTrader:
                 elif trigger:
                     pos_d  = self.engine.get_position(symbol, price)
                     record = await self._close(symbol, price, trigger, client=client)
+                    self.thesis_manager.close_thesis(symbol)
                     self._log("TRADE",
                         f"{trigger.upper()} — closed {pos_d['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
                         symbol, {"type": trigger, **record})
+                    return
+
+            # ── Dynamic Exit & Belief Manager (2026-07-23, see project memory
+            # and trading/thesis_manager.py) ── checked right after the hard
+            # SL/TP/liquidation trigger above, before this cycle's fresh
+            # signal/decision logic runs: if the position that's already open
+            # has a thesis and that thesis says its evidence no longer
+            # supports the trade (or a specific invalidation condition fired),
+            # exit now rather than waiting for a fresh directional signal to
+            # eventually flip and trigger a normal close_long/close_short.
+            if symbol in self.engine.positions:
+                thesis_ctx = {
+                    "price": price,
+                    "entry_price": self.engine.positions[symbol].entry_price,
+                    "oi_delta": market_sentiment.get("oi_4h_delta", 0.0),
+                    "cvd_ratio": market_sentiment.get("cvd_ratio", 0.5),
+                }
+                thesis_result = self.thesis_manager.evaluate(symbol, thesis_ctx)
+                if thesis_result and thesis_result["exit"]:
+                    cur_pos_for_thesis = self.engine.positions.get(symbol)
+                    side_for_thesis = cur_pos_for_thesis.side if cur_pos_for_thesis else "?"
+                    reason = f"thesis_{thesis_result['exit_reason']}"
+                    record = await self._close(symbol, price, reason, client=client)
+                    self.thesis_manager.close_thesis(symbol)
+                    self._log("TRADE",
+                        f"THESIS EXIT ({thesis_result['exit_reason']}, belief={thesis_result['belief_score']:+.2f}) — "
+                        f"closed {side_for_thesis.upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
+                        symbol, {"type": "thesis_exit", **record})
+                    get_journal().record("autotrader", symbol, f"close_{side_for_thesis}",
+                                          f"Thesis-Exit: {thesis_result['exit_reason']} (belief={thesis_result['belief_score']:+.2f})",
+                                          pnl=record["pnl"])
                     return
 
             # ── risk checks (daily loss + drawdown) ──
@@ -703,6 +740,7 @@ class AutoTrader:
                     f"OPEN {mode_tag}LONG {fill_amount:.6f} @ ${fill_price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag}{slip_tag}{fill_tag} | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_long", **record})
                 get_journal().record("autotrader", symbol, "open_long", reasoning)
+                self.thesis_manager.open_thesis(self._build_thesis(symbol, "long", fill_price, reasoning))
 
             elif action == "open_short" and not cur_pos:
                 self.position_stale_cycles[symbol] = 0
@@ -721,10 +759,12 @@ class AutoTrader:
                     f"OPEN {mode_tag}SHORT {fill_amount:.6f} @ ${fill_price:,.2f} | {leverage}x | Margin ${margin_use:.0f} | Risk ${risk_amount:.0f} ({risk_pct:.2%}){regime_tag}{slip_tag}{fill_tag} | Liq ${record['liq_price']:,.0f}",
                     symbol, {"type": "open_short", **record})
                 get_journal().record("autotrader", symbol, "open_short", reasoning)
+                self.thesis_manager.open_thesis(self._build_thesis(symbol, "short", fill_price, reasoning))
 
             elif action == "close_long" and cur_pos and cur_pos.side == "long":
                 record = await self._close(symbol, price, close_reason, client=client)
                 self.position_stale_cycles.pop(symbol, None)
+                self.thesis_manager.close_thesis(symbol)
                 self._log("TRADE",
                     f"CLOSE LONG ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
                     symbol, {"type": "close_long", **record})
@@ -733,6 +773,7 @@ class AutoTrader:
             elif action == "close_short" and cur_pos and cur_pos.side == "short":
                 record = await self._close(symbol, price, close_reason, client=client)
                 self.position_stale_cycles.pop(symbol, None)
+                self.thesis_manager.close_thesis(symbol)
                 self._log("TRADE",
                     f"CLOSE SHORT ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%",
                     symbol, {"type": "close_short", **record})
@@ -781,6 +822,7 @@ class AutoTrader:
                             pos = self.engine.get_position(symbol, price)
                             async with FuturesClient() as mclient:
                                 record = await self._close(symbol, price, trigger, client=mclient)
+                            self.thesis_manager.close_thesis(symbol)
                             self._log("TRADE",
                                 f"{trigger.upper()} (monitor) — closed {pos['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%",
                                 symbol, {"type": trigger, **record})
@@ -1032,6 +1074,55 @@ class AutoTrader:
         pnls = sym_pnls if len(sym_pnls) >= 20 else self._trade_pnls()
         kelly_pct = self.risk.kelly_risk_pct(pnls)
         return kelly_pct if kelly_pct is not None else default_pct
+
+    # ── Dynamic Exit & Belief Manager ────────────────────────────────────────
+    @staticmethod
+    def _build_thesis(symbol: str, direction: str, entry_price: float, reasoning: str) -> Thesis:
+        """V1 evidence/invalidation rule set (2026-07-23, see project memory
+        and trading/thesis_manager.py) — reasoned first-pass thresholds, not
+        yet independently validated the way e.g. the soft-gate confluence
+        design was; this is a new, deliberately transparent mechanism meant
+        to be observed and tuned over time, not a black box to trust blind.
+
+        is_long: price above entry / OI not collapsing / CVD skewed buy all
+        CONFIRM a long thesis (and the mirror image confirms a short).
+        """
+        is_long = direction == "long"
+        sign = 1 if is_long else -1
+
+        price_rule = EvidenceRule(
+            name="price_confirms", confirm_weight=1, contradict_weight=2, half_life_seconds=90,
+            check=lambda ctx: (sign * (ctx["price"] - ctx["entry_price"]) > 0)
+                                if ctx["price"] != ctx["entry_price"] else None,
+        )
+        oi_rule = EvidenceRule(
+            name="oi_confirms", confirm_weight=1, contradict_weight=1, half_life_seconds=300,
+            # OI moving in the direction that supports the thesis (fresh
+            # leverage building the same way, or at least not aggressively
+            # unwinding) confirms; OI collapsing against an open long (or
+            # building up against an open short) contradicts.
+            check=lambda ctx: (sign * ctx.get("oi_delta", 0.0) > -0.02),
+        )
+        orderflow_rule = EvidenceRule(
+            name="orderflow_confirms", confirm_weight=1, contradict_weight=1, half_life_seconds=15,
+            check=lambda ctx: (ctx.get("cvd_ratio", 0.5) > 0.5) if is_long else (ctx.get("cvd_ratio", 0.5) < 0.5),
+        )
+
+        def _counter_thesis(ctx: dict) -> bool:
+            # Hard invalidation: OI collapsing (fresh deleveraging) at the same
+            # time the price has already moved meaningfully against the
+            # thesis — a structural break, not normal noise. 0.5% price
+            # buffer so this doesn't fire on sub-noise wiggles right at entry.
+            price_broke = sign * (ctx["price"] - ctx["entry_price"]) < -0.005 * ctx["entry_price"]
+            oi_break = sign * ctx.get("oi_delta", 0.0) < -0.05
+            return price_broke and oi_break
+
+        return Thesis(
+            symbol=symbol, engine="autotrader", direction=direction, reasoning=reasoning,
+            evidence_rules=[price_rule, oi_rule, orderflow_rule],
+            invalidation_rules=[InvalidationRule(name="counter_thesis_confirmed", check=_counter_thesis)],
+            entry_price=entry_price,
+        )
 
     # ── confluence score ──────────────────────────────────────────────────────
     @staticmethod
@@ -1307,6 +1398,11 @@ class AutoTrader:
             p = self.live_prices.get(sym) or self.last_decisions.get(sym, {}).get("price", pos.entry_price)
             d = pos.to_dict(p)
             d["current_price"] = p
+            # Dynamic Exit & Belief Manager visibility (2026-07-23, see
+            # project memory) — last computed belief score, if this position
+            # has an active thesis (always should, but defensive either way).
+            thesis = self.thesis_manager.get(sym)
+            d["belief_score"] = thesis.last_belief_score if thesis else None
             result.append(d)
         return result
 
