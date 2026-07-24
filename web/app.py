@@ -192,7 +192,10 @@ async def _broadcast(msg: dict):
         except Exception:
             dead.append(ws)
     for ws in dead:
-        _ws_clients.remove(ws)
+        # a concurrent disconnect (websocket_endpoint's own handler, line ~209)
+        # can already have removed it while we were mid-loop awaiting sends
+        if ws in _ws_clients:
+            _ws_clients.remove(ws)
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────

@@ -145,7 +145,13 @@ class GridEngine:
                 qty = grid["qty"][i]
                 proceeds = qty * lines[i + 1]
                 fee = proceeds * MAKER_FEE
-                pnl = proceeds - fee - (qty * lines[i])
+                # buy_fee: paid out of reserve at fill time (see the buy loop
+                # above), same for every level since capital_per_level is
+                # constant — reserve already accounts for it correctly, but
+                # realized_pnl didn't, overstating reported profit per trade
+                # (same class of bug as futures_paper.py's entry-fee fix).
+                buy_fee = grid["capital_per_level"] * MAKER_FEE
+                pnl = proceeds - fee - (qty * lines[i]) - buy_fee
                 grid["reserve"] += (proceeds - fee)
                 grid["holding"][i] = False
                 grid["qty"][i] = 0.0
@@ -179,7 +185,8 @@ class GridEngine:
                 qty = grid["qty"][i]
                 proceeds = qty * price
                 fee = proceeds * MAKER_FEE
-                pnl = proceeds - fee - (qty * grid["lines"][i])
+                buy_fee = grid["capital_per_level"] * MAKER_FEE  # see update()'s sell loop
+                pnl = proceeds - fee - (qty * grid["lines"][i]) - buy_fee
                 grid["reserve"] += (proceeds - fee)
                 grid["fees_paid"] += fee
                 grid["realized_pnl"] += pnl

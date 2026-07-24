@@ -293,7 +293,7 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None,
 
     # Candlestick pattern signal (1 feature): lets the ensemble learn nonlinear
     # combinations of the same patterns the confluence scorer already checks
-    f["pattern_signal"] = (precomputed_pattern_signal.reindex(df.index)
+    f["pattern_signal"] = (precomputed_pattern_signal.reindex(df.index).fillna(0)
                             if precomputed_pattern_signal is not None else _pattern_signal(df))
 
     # Cycle strength (1 feature): detrended, differenced, Hann-windowed dominant-
@@ -307,8 +307,14 @@ def build_features(df: pd.DataFrame, funding_series: pd.Series = None,
     # (ai/vol_regime.py::classify_vol_regime multiplies risk_pct post-hoc), now
     # also given to the model directly so it can learn regime-conditional
     # patterns instead of only having its output de-rated after the fact.
-    f["prob_storm"] = (precomputed_prob_storm.reindex(df.index)
+    f["prob_storm"] = (precomputed_prob_storm.reindex(df.index).fillna(0.0)
                         if precomputed_prob_storm is not None else rolling_prob_storm(df))
+
+    # volume_ratio/vwap_dist divide by rolling volume sums that can be exactly
+    # zero on thin symbols or data gaps, producing +-inf rather than NaN — inf
+    # survives dropna() downstream and poisons the scaler/model fit, so convert
+    # it to NaN here where the rest of the pipeline already knows how to handle it.
+    f = f.replace([np.inf, -np.inf], np.nan)
 
     return f
 
@@ -351,6 +357,11 @@ def train(df: pd.DataFrame, symbol: str = "BTC/USDT",
     labels   = make_labels(df)
 
     valid = features.dropna().index.intersection(labels.dropna().index)
+    if len(valid) <= 3:
+        raise ValueError(
+            f"not enough valid rows to train {symbol} ({len(valid)} after dropna/warmup) "
+            f"— need more history (raise the candle limit)"
+        )
     valid = valid[:-3]
     X = features.loc[valid]
     y = labels.loc[valid]

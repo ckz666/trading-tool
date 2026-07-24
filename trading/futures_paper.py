@@ -225,6 +225,8 @@ class FuturesPaperEngine:
         fixed default — see calc_liquidation_price docstring."""
         if symbol in self.positions:
             raise ValueError(f"Position already open for {symbol}. Close first.")
+        if leverage < 1:
+            raise ValueError(f"Invalid leverage {leverage} — must be >= 1")
 
         notional = amount * price
         margin = notional / leverage
@@ -346,7 +348,10 @@ class FuturesPaperEngine:
             "exit_price":  price,
             "leverage":    pos.leverage,
             "pnl":         round(pnl_net, 4),
-            "roe_pct":     round(pnl_net / orig_margin * 100, 2) if orig_margin else 0,
+            # pnl_net covers only the closed fraction — divide by the margin
+            # attributable to that same fraction, not the whole position's
+            # margin, or this understates ROE by exactly close_fraction.
+            "roe_pct":     round(pnl_net / (orig_margin * close_fraction) * 100, 2) if orig_margin and close_fraction else 0,
             "mode":        pos.mode,
             "ts":          datetime.now().isoformat(),
         }

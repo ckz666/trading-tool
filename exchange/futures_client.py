@@ -1,3 +1,4 @@
+import asyncio
 import time
 import aiohttp
 import ccxt.async_support as ccxt
@@ -23,6 +24,9 @@ def to_futures_symbol(symbol: str) -> str:
 # from calling the tiers endpoint on every single position open once warm.
 _MMR_CACHE: dict[str, tuple[float, float]] = {}   # symbol -> (rate, cached_at)
 _MMR_CACHE_TTL = 3600.0   # tiers change rarely, 1h is plenty
+_MMR_LOCKS: dict[str, asyncio.Lock] = {}   # per-symbol, avoids concurrent tasks
+                                            # all missing the cold cache and
+                                            # firing redundant tiers fetches
 
 
 class FuturesClient:
@@ -89,6 +93,8 @@ class FuturesClient:
         except Exception:
             return None
         levels = ob.get("asks") if side == "buy" else ob.get("bids")
+        if not levels:
+            return None
         return walk_orderbook(levels, notional_usdt)
 
     async def fetch_funding_rate(self, symbol: str) -> dict | None:
@@ -99,8 +105,11 @@ class FuturesClient:
         None and skip the symbol/cycle rather than treat a failed fetch as data."""
         try:
             fr = await self._exchange.fetch_funding_rate(to_futures_symbol(symbol))
+            rate = fr.get("fundingRate")
+            if rate is None:
+                return None  # key missing from a successful response is still "no data"
             return {
-                "rate": fr.get("fundingRate", 0),
+                "rate": rate,
                 "next_ts": fr.get("nextFundingDatetime", ""),
             }
         except Exception:
@@ -110,7 +119,10 @@ class FuturesClient:
         """Returns None on failure — see fetch_funding_rate docstring, same fix."""
         try:
             oi = await self._exchange.fetch_open_interest(to_futures_symbol(symbol))
-            return {"open_interest": oi.get("openInterest", 0)}
+            open_interest = oi.get("openInterest")
+            if open_interest is None:
+                return None
+            return {"open_interest": open_interest}
         except Exception:
             return None
 
@@ -229,21 +241,27 @@ class FuturesClient:
         cached = _MMR_CACHE.get(symbol)
         if cached and now - cached[1] < _MMR_CACHE_TTL:
             return cached[0]
-        try:
-            tiers = await self._exchange.fetch_market_leverage_tiers(to_futures_symbol(symbol))
-            rate = 0.005
-            for t in tiers:
-                min_n, max_n = t.get("minNotional", 0.0), t.get("maxNotional")
-                if notional >= min_n and (max_n is None or notional < max_n):
-                    rate = t.get("maintenanceMarginRate", 0.005)
-                    break
-            else:
-                if tiers:
-                    rate = tiers[0].get("maintenanceMarginRate", 0.005)   # smallest tier as fallback
-            _MMR_CACHE[symbol] = (rate, now)
-            return rate
-        except Exception:
-            return 0.005
+        lock = _MMR_LOCKS.setdefault(symbol, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()  # re-check: another task may have filled it while we waited
+            cached = _MMR_CACHE.get(symbol)
+            if cached and now - cached[1] < _MMR_CACHE_TTL:
+                return cached[0]
+            try:
+                tiers = await self._exchange.fetch_market_leverage_tiers(to_futures_symbol(symbol))
+                rate = 0.005
+                for t in tiers:
+                    min_n, max_n = t.get("minNotional", 0.0), t.get("maxNotional")
+                    if notional >= min_n and (max_n is None or notional < max_n):
+                        rate = t.get("maintenanceMarginRate", 0.005)
+                        break
+                else:
+                    if tiers:
+                        rate = tiers[0].get("maintenanceMarginRate", 0.005)   # smallest tier as fallback
+                _MMR_CACHE[symbol] = (rate, now)
+                return rate
+            except Exception:
+                return 0.005
 
     async def set_leverage(self, symbol: str, leverage: int):
         await self._exchange.set_leverage(leverage, to_futures_symbol(symbol))

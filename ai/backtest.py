@@ -166,6 +166,8 @@ def run_backtest(
 
     if len(df_1h) < 200:
         return {"error": "Need at least 200 candles"}
+    if leverage < 1:
+        return {"error": f"Invalid leverage {leverage} — must be >= 1"}
 
     split = int(len(df_1h) * train_pct)
     df_train = df_1h.iloc[:split].copy()
