@@ -116,7 +116,7 @@ class Thesis:
         self._readings = [r for r in self._readings if r.rule_name != rule_name]
         self._readings.append(_EvidenceReading(rule_name=rule_name, value=value, ts=now))
 
-    def _compute_belief(self) -> float:
+    def _compute_belief(self, event_type: str = "evaluation") -> float:
         now = datetime.now()
         rules_by_name = {r.name: r for r in self.evidence_rules}
         score = 0.0
@@ -131,7 +131,13 @@ class Thesis:
         self.last_belief_score = score
         self.belief_min = score if self.belief_min is None else min(self.belief_min, score)
         self.belief_max = score if self.belief_max is None else max(self.belief_max, score)
-        self.belief_history.append({"ts": now.isoformat(), "belief_score": round(score, 3)})
+        # event_type distinguishes a real per-cycle market observation from
+        # the one extra data point a restart produces (restore_readings()
+        # calls this once after reconstructing a thesis) — later analysis
+        # of "how often did belief move within N minutes" should filter
+        # restore snapshots out, they're an artifact of the process, not
+        # a market observation.
+        self.belief_history.append({"ts": now.isoformat(), "belief_score": round(score, 3), "event_type": event_type})
         self.belief_history = self.belief_history[-500:]   # bounded, same convention as
                                                              # every other rolling list here
         return score
@@ -200,7 +206,7 @@ class Thesis:
             except (KeyError, ValueError):
                 continue
             self._readings.append(_EvidenceReading(rule_name=r["rule_name"], value=r["value"], ts=ts))
-        self._compute_belief()
+        self._compute_belief(event_type="restore")
 
 
 class ThesisManager:
@@ -265,17 +271,23 @@ class ThesisManager:
 
     def close_thesis(self, symbol: str) -> Optional[dict]:
         """Pops the thesis and returns an observability summary (belief at
-        entry/exit, min/max, full history, duration) for the caller to attach
-        to its trade-journal entry for the same close event — see module
-        docstring on why this exists (instrument V1, don't build V2 blind).
-        None if there was no open thesis for this symbol."""
+        first evaluation/exit, min/max, full history, duration) for the
+        caller to attach to its trade-journal entry for the same close
+        event — see module docstring on why this exists (instrument V1,
+        don't build V2 blind). None if there was no open thesis for this
+        symbol."""
         thesis = self._theses.pop(symbol, None)
         self._save()
         if thesis is None:
             return None
         duration = (datetime.now() - thesis.created_at).total_seconds()
         return {
-            "belief_at_entry": thesis.belief_history[0]["belief_score"] if thesis.belief_history else None,
+            # NOT "belief at entry" — no evidence exists yet at creation
+            # (empty readings -> a literal entry-time score is always a
+            # trivial 0, no information). This is the score at the first
+            # real evaluate() call after entry, which is what's actually
+            # useful for later analysis.
+            "belief_at_first_evaluation": thesis.belief_history[0]["belief_score"] if thesis.belief_history else None,
             "belief_at_exit": thesis.last_belief_score,
             "belief_min": thesis.belief_min,
             "belief_max": thesis.belief_max,

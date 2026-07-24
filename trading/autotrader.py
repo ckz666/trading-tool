@@ -1220,6 +1220,13 @@ class AutoTrader:
         # (ChatGPT's confirming refinement — invalidation isn't only "folded
         # into" the score threshold). Same check function, two different
         # roles — not a bug, both are needed for the agreed design.
+        #
+        # The -3 in belief_score is a historical observability data point
+        # (shows up in belief_history/belief_min for later analysis) — it
+        # does NOT drive the exit by itself. The exit itself happens
+        # unconditionally through the separate InvalidationRule below the
+        # instant _counter_thesis() returns True, independent of whatever
+        # the aggregate score happens to be at that moment.
         counter_thesis_rule = EvidenceRule(
             name="counter_thesis_confirmed", confirm_weight=0, contradict_weight=3, half_life_seconds=300,
             check=lambda ctx: False if _counter_thesis(ctx) else None,
