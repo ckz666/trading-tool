@@ -427,12 +427,21 @@ class AutoTrader:
                     # do full-close cleanup (thesis, stale-cycle tracking)
                     # when the position is actually gone.
                     fully_closed = symbol not in self.engine.positions
+                    thesis_summary = None
                     if fully_closed:
-                        self.thesis_manager.close_thesis(symbol)
+                        thesis_summary = self.thesis_manager.close_thesis(symbol)
                     partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen)"
                     self._log("TRADE",
                         f"{trigger.upper()} — closed {pos_d['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%{partial_tag}",
                         symbol, {"type": trigger, **record})
+                    # This path had no journal entry at all before (2026-07-24) —
+                    # added so hard SL/TP closes aren't invisible to the belief-
+                    # trajectory analysis this instrumentation exists for (a
+                    # position with a thesis that hit its hard stop is exactly
+                    # the kind of case worth comparing against thesis-triggered
+                    # exits later).
+                    get_journal().record("autotrader", symbol, f"close_{pos_d['side']}", trigger,
+                                          pnl=record["pnl"], extra=thesis_summary)
                     return
 
             # ── Dynamic Exit & Belief Manager (2026-07-23, see project memory
@@ -469,8 +478,9 @@ class AutoTrader:
                         reason = f"thesis_{thesis_result['exit_reason']}"
                         record = await self._close(symbol, price, reason, client=client)
                         fully_closed = symbol not in self.engine.positions
+                        thesis_summary = None
                         if fully_closed:
-                            self.thesis_manager.close_thesis(symbol)
+                            thesis_summary = self.thesis_manager.close_thesis(symbol)
                             thesis_exit_happened = True
                         partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen, Thesis läuft weiter)"
                         self._log("TRADE",
@@ -479,7 +489,8 @@ class AutoTrader:
                             symbol, {"type": "thesis_exit", **record})
                         get_journal().record("autotrader", symbol, f"close_{side_for_thesis}",
                                               f"Thesis-Exit: {thesis_result['exit_reason']} (belief={thesis_result['belief_score']:+.2f})",
-                                              pnl=record["pnl"])
+                                              pnl=record["pnl"],
+                                              extra={"exit_reason": thesis_result["exit_reason"], **(thesis_summary or {})})
             if thesis_exit_happened:
                 # Same convention as the hard SL/TP trigger above: skip this
                 # cycle's fresh signal/decision logic for a symbol that was
@@ -817,26 +828,28 @@ class AutoTrader:
             elif action == "close_long" and cur_pos and cur_pos.side == "long":
                 record = await self._close(symbol, price, close_reason, client=client)
                 fully_closed = symbol not in self.engine.positions
+                thesis_summary = None
                 if fully_closed:
                     self.position_stale_cycles.pop(symbol, None)
-                    self.thesis_manager.close_thesis(symbol)
+                    thesis_summary = self.thesis_manager.close_thesis(symbol)
                 partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen)"
                 self._log("TRADE",
                     f"CLOSE LONG ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%{partial_tag}",
                     symbol, {"type": "close_long", **record})
-                get_journal().record("autotrader", symbol, "close_long", close_reason, pnl=record["pnl"])
+                get_journal().record("autotrader", symbol, "close_long", close_reason, pnl=record["pnl"], extra=thesis_summary)
 
             elif action == "close_short" and cur_pos and cur_pos.side == "short":
                 record = await self._close(symbol, price, close_reason, client=client)
                 fully_closed = symbol not in self.engine.positions
+                thesis_summary = None
                 if fully_closed:
                     self.position_stale_cycles.pop(symbol, None)
-                    self.thesis_manager.close_thesis(symbol)
+                    thesis_summary = self.thesis_manager.close_thesis(symbol)
                 partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen)"
                 self._log("TRADE",
                     f"CLOSE SHORT ({close_reason}) @ ${record['exit_price']:,.2f} | PnL {record['pnl']:+.2f} USDT | ROE {record['roe_pct']:+.1f}%{partial_tag}",
                     symbol, {"type": "close_short", **record})
-                get_journal().record("autotrader", symbol, "close_short", close_reason, pnl=record["pnl"])
+                get_journal().record("autotrader", symbol, "close_short", close_reason, pnl=record["pnl"], extra=thesis_summary)
 
             else:
                 self._log("INFO", f"HOLD (action={action}, pos={'open' if cur_pos else 'none'})", symbol)
@@ -882,14 +895,15 @@ class AutoTrader:
                             async with FuturesClient() as mclient:
                                 record = await self._close(symbol, price, trigger, client=mclient)
                             fully_closed = symbol not in self.engine.positions
+                            thesis_summary = None
                             if fully_closed:
-                                self.thesis_manager.close_thesis(symbol)
+                                thesis_summary = self.thesis_manager.close_thesis(symbol)
                             partial_tag = "" if fully_closed else " (nur teilgefüllt, Rest bleibt offen)"
                             self._log("TRADE",
                                 f"{trigger.upper()} (monitor) — closed {pos['side'].upper()} @ ${record['exit_price']:,.2f} | PnL: {record['pnl']:+.2f} USDT | ROE: {record['roe_pct']:+.1f}%{partial_tag}",
                                 symbol, {"type": trigger, **record})
                             get_journal().record("autotrader", symbol, f"close_{pos['side']}", trigger,
-                                                  pnl=record["pnl"])
+                                                  pnl=record["pnl"], extra=thesis_summary)
             except Exception as e:
                 self._log("ERROR", f"Monitor-Loop Fehler: {e}", "ALL")
 

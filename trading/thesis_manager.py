@@ -36,6 +36,16 @@ OI buffer, CVD) needed for meaningful evidence rules with the least new
 plumbing. The other three engines are a documented follow-up, not done
 here.
 
+Instrumentation (2026-07-24, user explicitly asked to instrument V1 for
+observability rather than build V2 blind): every evaluate() call appends
+{ts, belief_score} to belief_history and updates belief_min/belief_max, so
+V2 (partial reduction on a sagging-but-not-negative belief) can later be
+justified — or ruled out — from real trade data instead of design
+speculation. close_thesis() returns a summary (belief at entry/exit,
+min/max, duration) that callers attach to the trade journal entry for the
+same close event, so per-trade belief trajectories are reconstructable
+after the fact without a dedicated UI.
+
 Persistence (2026-07-23, added after the user caught a real position's
 belief_score showing empty post-restart — thesis state was pure in-memory,
 so every service restart silently dropped exit protection for whatever was
@@ -94,6 +104,9 @@ class Thesis:
     created_at: datetime = field(default_factory=datetime.now)
     _readings: list[_EvidenceReading] = field(default_factory=list)
     last_belief_score: float = 0.0
+    belief_history: list = field(default_factory=list)   # [{"ts": iso, "belief_score": float}]
+    belief_min: float = None
+    belief_max: float = None
 
     def _record(self, rule_name: str, value: bool):
         now = datetime.now()
@@ -116,6 +129,11 @@ class Thesis:
             weight = rule.confirm_weight if reading.value else -rule.contradict_weight
             score += weight * freshness
         self.last_belief_score = score
+        self.belief_min = score if self.belief_min is None else min(self.belief_min, score)
+        self.belief_max = score if self.belief_max is None else max(self.belief_max, score)
+        self.belief_history.append({"ts": now.isoformat(), "belief_score": round(score, 3)})
+        self.belief_history = self.belief_history[-500:]   # bounded, same convention as
+                                                             # every other rolling list here
         return score
 
     def evaluate(self, context: dict) -> dict:
@@ -160,6 +178,9 @@ class Thesis:
             "entry_price": self.entry_price,
             "created_at": self.created_at.isoformat(),
             "last_belief_score": self.last_belief_score,
+            "belief_history": self.belief_history,
+            "belief_min": self.belief_min,
+            "belief_max": self.belief_max,
             "readings": [
                 {"rule_name": r.rule_name, "value": r.value, "ts": r.ts.isoformat()}
                 for r in self._readings
@@ -223,6 +244,12 @@ class ThesisManager:
             for sym, d in data.items():
                 thesis = self.rebuild_fn(sym, d["direction"], d["entry_price"], d["reasoning"])
                 thesis.created_at = datetime.fromisoformat(d["created_at"])
+                # restore history/min/max BEFORE replaying readings — restore_readings()
+                # triggers one more _compute_belief() call, which correctly folds into
+                # these restored bounds rather than resetting them from a null baseline
+                thesis.belief_history = d.get("belief_history", [])
+                thesis.belief_min = d.get("belief_min")
+                thesis.belief_max = d.get("belief_max")
                 thesis.restore_readings(d.get("readings", []))
                 self._theses[sym] = thesis
             print(f"[ThesisManager:{self.state_file}] Restored {len(self._theses)} open thesis/theses")
@@ -236,9 +263,25 @@ class ThesisManager:
     def get(self, symbol: str) -> Optional[Thesis]:
         return self._theses.get(symbol)
 
-    def close_thesis(self, symbol: str):
-        self._theses.pop(symbol, None)
+    def close_thesis(self, symbol: str) -> Optional[dict]:
+        """Pops the thesis and returns an observability summary (belief at
+        entry/exit, min/max, full history, duration) for the caller to attach
+        to its trade-journal entry for the same close event — see module
+        docstring on why this exists (instrument V1, don't build V2 blind).
+        None if there was no open thesis for this symbol."""
+        thesis = self._theses.pop(symbol, None)
         self._save()
+        if thesis is None:
+            return None
+        duration = (datetime.now() - thesis.created_at).total_seconds()
+        return {
+            "belief_at_entry": thesis.belief_history[0]["belief_score"] if thesis.belief_history else None,
+            "belief_at_exit": thesis.last_belief_score,
+            "belief_min": thesis.belief_min,
+            "belief_max": thesis.belief_max,
+            "belief_duration_seconds": round(duration, 1),
+            "belief_history": thesis.belief_history,
+        }
 
     def evaluate(self, symbol: str, context: dict) -> Optional[dict]:
         thesis = self._theses.get(symbol)
